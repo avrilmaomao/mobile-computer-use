@@ -47,6 +47,8 @@ Android requires `adb`; `scrcpy` is required only for live mirroring. The contro
 
 iOS requires Python 3, `pymobiledevice3`, Node.js, Appium with the XCUITest driver, a trusted physical device, and a WebDriverAgent IPA signed for that device. iOS signing assets are intentionally not included. Configure the signed IPA and runner bundle ID with `IOS_CUCTL_WDA_IPA` and `IOS_CUCTL_WDA_BUNDLE_ID`. After initial USB pairing, `wifi-tunnel-start` provides a persistent Wi-Fi RemoteXPC path that ordinary bridge commands reuse automatically.
 
+On a dedicated Linux host, the bundled `ios-computer-use-tunneld@.service` can be installed once as a constrained system service. It runs as the selected user with only `CAP_NET_ADMIN`, starts at boot, and avoids a new sudo/polkit dialog for each wireless session. See the iOS operations guide for the one-time installation commands.
+
 Run the read-only checks after installation:
 
 ```bash

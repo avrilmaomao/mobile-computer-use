@@ -1,0 +1,37 @@
+[Unit]
+Description=Persistent iOS RemoteXPC tunnel service for %i
+After=network-online.target usbmuxd.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%i
+Group=%i
+Environment=HOME=/home/%i
+Environment=PATH=/home/%i/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+ExecStart=/usr/bin/env pymobiledevice3 remote tunneld --host 127.0.0.1 --port 49151 --protocol tcp --usb --wifi --usbmux --mobdev2
+Restart=on-failure
+RestartSec=2
+
+# TUN creation and route management need only CAP_NET_ADMIN. The daemon still
+# runs as the named desktop user so it can read that user's pairing records.
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+NoNewPrivileges=true
+
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/%i/.pymobiledevice3
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+DevicePolicy=closed
+DeviceAllow=/dev/net/tun rw
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

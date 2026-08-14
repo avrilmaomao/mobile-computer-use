@@ -19,6 +19,7 @@ The bridge is portable and reads these optional environment variables:
 | `IOS_CUCTL_WDA_BUNDLE_ID` | `com.facebook.WebDriverAgentRunner.xctrunner` | Actual signed WDA runner bundle ID |
 | `IOS_CUCTL_TRANSPORT` | `auto` | Force `usb` or `wifi`; `auto` prefers a running bridge-managed Wi-Fi tunnel |
 | `IOS_CUCTL_RSD_ADDRESS` / `IOS_CUCTL_RSD_PORT` | unset | Reuse a manually created RSD tunnel |
+| `IOS_CUCTL_SYSTEM_TUNNEL_PORT` | `49151` | Registry port of the optional persistent system tunneld |
 
 The bridge also detects the tested portable Node/Appium layout under `$IOS_CUCTL_SHARE_DIR/tools/`. Keep machine-specific values in the shell environment; never commit them with signing assets.
 
@@ -94,6 +95,29 @@ To prove and use a fully wireless RemoteXPC path, keep this command running in a
 ```
 
 Linux shows one administrator authorization prompt because the tunnel creates a TUN interface. Once the command prints that the Wi-Fi tunnel is ready, ordinary `screenshot`, `press`, `start`, `source`, `tap-image`, `swipe-image`, and element commands automatically prefer that Wi-Fi RSD connection. Check it from another terminal with `wifi-tunnel-status`. Stop it with `Ctrl+C`; the bridge removes its transient state file. If USB is already unplugged, pass the known `--udid` before the subcommand and `--platform-version` after it when WDA/Appium input will be used.
+
+### Avoid repeated administrator prompts
+
+WDA/XCTest needs a kernel-routable TUN interface because the iPhone opens an inbound TCP connection back to the host. A root-free userspace tunnel can handle screenshots and other host-initiated services, but it cannot provide this WDA callback path. Do not replace the prompt with broad passwordless sudo or a permissive polkit rule.
+
+For a dedicated Linux host, install the bundled systemd template once. The service runs as the selected desktop user and receives only `CAP_NET_ADMIN`; it listens on loopback port `49151`, monitors USB and Wi-Fi devices, and starts at boot:
+
+```bash
+sudo install -m 0644 \
+  "$HOME/ios-computer-use/ios-computer-use-tunneld@.service" \
+  /etc/systemd/system/ios-computer-use-tunneld@.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now "ios-computer-use-tunneld@$(id -un).service"
+```
+
+These are the only administrator-authorized installation steps. Afterward, agents should reuse the service without `sudo` or `wifi-tunnel-start`:
+
+```bash
+systemctl status "ios-computer-use-tunneld@$(id -un).service" --no-pager
+"$HOME/ios-computer-use/ios-cuctl" tunnel-status
+```
+
+The bridge checks this registry before its older per-session registry and prefers a registry containing an active device tunnel. Granting `CAP_NET_ADMIN` lets this service manage host TUN interfaces and routes; it is narrower than root but remains a host networking privilege. If the user home is not `/home/<user>` or `pymobiledevice3` is installed outside the template's `PATH`, copy the template and adjust `Environment` and `ReadWritePaths` before installing it.
 
 CoreDevice screenshots and hardware `press` can operate while the display is locked. WDA/Appium accessibility, touch, and text input require the device to be unlocked; if the phone locks during wireless WDA startup, iOS may terminate the XCTest connection. Never attempt to bypass the lock screen—ask the user to unlock and retry.
 

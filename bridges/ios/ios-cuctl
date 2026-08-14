@@ -51,6 +51,7 @@ WDA_RUNNER_LOG = STATE_DIR / "wda-runner.log"
 WIFI_TUNNEL_FILE = STATE_DIR / "wifi-tunnel.json"
 WDA_RUNNER = Path(os.environ.get("IOS_CUCTL_WDA_RUNNER", BRIDGE_DIR / "wda-runner")).expanduser()
 DEFAULT_TUNNEL_REGISTRY_PORT = 42314
+SYSTEM_TUNNEL_REGISTRY_PORT = int(os.environ.get("IOS_CUCTL_SYSTEM_TUNNEL_PORT", "49151"))
 TUNNEL_PORT_FILE = Path(
     os.environ.get(
         "IOS_CUCTL_TUNNEL_PORT_FILE",
@@ -206,14 +207,23 @@ def tunnel_registry(port: int, *, timeout: float = 2.0) -> dict[str, Any] | None
 
 
 def active_tunnel_registry() -> tuple[int, dict[str, Any]] | None:
-    candidates = [read_tunnel_registry_port(), DEFAULT_TUNNEL_REGISTRY_PORT]
+    candidates = [
+        read_tunnel_registry_port(),
+        SYSTEM_TUNNEL_REGISTRY_PORT,
+        DEFAULT_TUNNEL_REGISTRY_PORT,
+    ]
+    fallback: tuple[int, dict[str, Any]] | None = None
     for port in dict.fromkeys(x for x in candidates if x is not None):
         data = tunnel_registry(port)
         if data is not None:
+            tunnels = data.get("tunnels")
+            if not isinstance(tunnels, dict) or not tunnels:
+                fallback = fallback or (port, data)
+                continue
             if port != read_tunnel_registry_port():
                 write_tunnel_registry_port(port)
             return port, data
-    return None
+    return fallback
 
 
 def ensure_remote_xpc(udid: str) -> dict[str, Any]:

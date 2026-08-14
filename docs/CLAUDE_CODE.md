@@ -19,6 +19,7 @@ cd mobile-computer-use
 ~/android-computer-use/AGENTS.md
 ~/ios-computer-use/ios-cuctl
 ~/ios-computer-use/wda-runner
+~/ios-computer-use/ios-computer-use-tunneld@.service
 ~/ios-computer-use/AGENTS.md
 ```
 
@@ -79,6 +80,22 @@ export IOS_CUCTL_WDA_BUNDLE_ID="your.signed.WebDriverAgentRunner.xctrunner"
 
 5. iOS 18+ 在 Linux 上使用输入和 accessibility 前需要保持 RemoteXPC tunnel 运行。首次提权会出现系统授权弹窗，这是正常的权限边界。
 
+若是固定使用的 Linux 主机，建议一次性安装受限的 systemd tunnel 服务。服务仍以当前桌面用户运行，只获得创建 TUN 和路由所需的 `CAP_NET_ADMIN`，之后开机自启，Claude Code 日常操作不再出现 sudo/polkit 弹窗：
+
+```bash
+sudo install -m 0644 \
+  "$HOME/ios-computer-use/ios-computer-use-tunneld@.service" \
+  /etc/systemd/system/ios-computer-use-tunneld@.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now "ios-computer-use-tunneld@$(id -un).service"
+```
+
+不要配置全局免密 sudo 或放宽 polkit。`CAP_NET_ADMIN` 仍属于主机网络管理权限，只是明显小于 root 权限；上述安装步骤只需授权一次，之后用普通用户检查：
+
+```bash
+"$HOME/ios-computer-use/ios-cuctl" tunnel-status
+```
+
 完全无线使用时，在一个终端持续运行：
 
 ```bash
@@ -86,6 +103,8 @@ export IOS_CUCTL_WDA_BUNDLE_ID="your.signed.WebDriverAgentRunner.xctrunner"
 ```
 
 显示 ready 后，另一个终端里的 `screenshot`、`press`、WDA/Appium 输入和元素命令会自动复用 Wi‑Fi RSD。用 `wifi-tunnel-status` 确认状态；通过真实截图和一次可逆 Home 键操作验收。首次仍建议保留 USB 完成 Trust、配对、DeveloperDiskImage 和 WDA 安装。
+
+已安装上面的 systemd 服务时，不要再运行 `wifi-tunnel-start`；bridge 会从端口 `49151` 自动发现并复用常驻 tunnel。
 
 锁屏时仍可使用 CoreDevice 截图和硬件键；WDA accessibility、触控和文字输入必须由用户先解锁设备，不能绕过锁屏。
 
