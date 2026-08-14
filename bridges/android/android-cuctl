@@ -17,8 +17,10 @@ Usage: android-cuctl COMMAND [ARGS...]
 Connection and status:
   doctor                         Check host tools and list ADB devices
   devices                        List attached and paired ADB devices
+  discover                       List Android Wireless Debugging mDNS services
   pair HOST:PORT                 Pair using Android 11+ Wireless debugging
   connect HOST[:PORT]            Connect to a paired wireless device
+  connect-auto                   Connect when exactly one paired mDNS target is advertised
   disconnect [HOST[:PORT]]       Disconnect one or all wireless devices
   serial                         Print the selected authorized device serial
   info                           Print basic selected-device information
@@ -154,6 +156,12 @@ case "$command" in
     adb devices -l
     ;;
 
+  discover)
+    [[ $# -eq 0 ]] || fail "usage: android-cuctl discover"
+    need_cmd adb
+    adb mdns services
+    ;;
+
   pair)
     [[ $# -eq 1 ]] || fail "usage: android-cuctl pair HOST:PORT"
     need_cmd adb
@@ -166,6 +174,30 @@ case "$command" in
     need_cmd adb
     [[ "$1" != *[[:space:]]* ]] || fail "host must not contain whitespace"
     adb connect "$1"
+    ;;
+
+  connect-auto)
+    [[ $# -eq 0 ]] || fail "usage: android-cuctl connect-auto"
+    need_cmd adb
+    mapfile -t online_wireless < <(adb devices | awk 'NR > 1 && $2 == "device" && $1 ~ /:/ { print $1 }')
+    if [[ "${#online_wireless[@]}" -eq 1 ]]; then
+      printf 'already connected to %s\n' "${online_wireless[0]}"
+      exit 0
+    elif [[ "${#online_wireless[@]}" -gt 1 ]]; then
+      fail "multiple wireless ADB targets are already online; set ANDROID_SERIAL explicitly"
+    fi
+    mapfile -t endpoints < <(adb mdns services | awk '$2 == "_adb-tls-connect._tcp" { print $3 }')
+    case "${#endpoints[@]}" in
+      0)
+        fail "no paired Wireless Debugging connect service was discovered"
+        ;;
+      1)
+        adb connect "${endpoints[0]}"
+        ;;
+      *)
+        fail "multiple Wireless Debugging targets were discovered; use 'discover' and connect the intended HOST:PORT"
+        ;;
+    esac
     ;;
 
   disconnect)

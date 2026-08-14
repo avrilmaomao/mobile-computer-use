@@ -54,6 +54,15 @@ cd mobile-computer-use
 3. Android 11+ 可使用 Wireless debugging：先 `pair`，再用主界面显示的调试端口执行 `connect`。
 4. 多设备在线时设置精确的 `ANDROID_SERIAL`，不要让 agent 猜设备。
 
+已配对设备再次上线时，可直接自动发现并连接：
+
+```bash
+"$HOME/android-computer-use/android-cuctl" discover
+"$HOME/android-computer-use/android-cuctl" connect-auto
+```
+
+`connect-auto` 只会在局域网中恰好发现一个已配对 connect 服务时继续；多个设备时必须显式选择。
+
 完整操作说明见安装后的 `$HOME/android-computer-use/AGENTS.md`。
 
 ## iOS 准备
@@ -69,6 +78,14 @@ export IOS_CUCTL_WDA_BUNDLE_ID="your.signed.WebDriverAgentRunner.xctrunner"
 ```
 
 5. iOS 18+ 在 Linux 上使用输入和 accessibility 前需要保持 RemoteXPC tunnel 运行。首次提权会出现系统授权弹窗，这是正常的权限边界。
+
+完全无线使用时，在一个终端持续运行：
+
+```bash
+"$HOME/ios-computer-use/ios-cuctl" wifi-tunnel-start
+```
+
+显示 ready 后，另一个终端里的 `screenshot`、`press`、WDA/Appium 输入和元素命令会自动复用 Wi‑Fi RSD。用 `wifi-tunnel-status` 确认状态；通过真实截图和一次可逆 Home 键操作验收。首次仍建议保留 USB 完成 Trust、配对、DeveloperDiskImage 和 WDA 安装。
 
 完整操作、环境变量和恢复说明见安装后的 `$HOME/ios-computer-use/AGENTS.md`。
 

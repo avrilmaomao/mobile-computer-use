@@ -17,6 +17,8 @@ The bridge is portable and reads these optional environment variables:
 | `IOS_CUCTL_NODE_BIN_DIR` | directory containing `node` | Node.js binary directory |
 | `IOS_CUCTL_WDA_IPA` | `$IOS_CUCTL_SHARE_DIR/artifacts/WebDriverAgentRunner.ipa` | Signed WDA IPA |
 | `IOS_CUCTL_WDA_BUNDLE_ID` | `com.facebook.WebDriverAgentRunner.xctrunner` | Actual signed WDA runner bundle ID |
+| `IOS_CUCTL_TRANSPORT` | `auto` | Force `usb` or `wifi`; `auto` prefers a running bridge-managed Wi-Fi tunnel |
+| `IOS_CUCTL_RSD_ADDRESS` / `IOS_CUCTL_RSD_PORT` | unset | Reuse a manually created RSD tunnel |
 
 The bridge also detects the tested portable Node/Appium layout under `$IOS_CUCTL_SHARE_DIR/tools/`. Keep machine-specific values in the shell environment; never commit them with signing assets.
 
@@ -84,6 +86,16 @@ Initial setup requires an unlocked USB connection and the user's Trust approval.
 ```
 
 `wireless-on` enables lockdownd Wi-Fi connections and bootstraps RemotePairing over the already-trusted USB channel. Later wireless use requires the host and phone on the same LAN. Keep USB available for first setup, signing/profile recovery, and the most reliable long sessions.
+
+To prove and use a fully wireless RemoteXPC path, keep this command running in a dedicated terminal:
+
+```bash
+"$HOME/ios-computer-use/ios-cuctl" wifi-tunnel-start
+```
+
+Linux shows one administrator authorization prompt because the tunnel creates a TUN interface. Once the command prints that the Wi-Fi tunnel is ready, ordinary `screenshot`, `press`, `start`, `source`, `tap-image`, `swipe-image`, and element commands automatically prefer that Wi-Fi RSD connection. Check it from another terminal with `wifi-tunnel-status`. Stop it with `Ctrl+C`; the bridge removes its transient state file. If USB is already unplugged, pass the known `--udid` before the subcommand and `--platform-version` after it when WDA/Appium input will be used.
+
+For a tunnel started outside the bridge, set `IOS_CUCTL_RSD_ADDRESS`, `IOS_CUCTL_RSD_PORT`, `IOS_CUCTL_WIFI_UDID`, and optionally `IOS_CUCTL_WIFI_PLATFORM_VERSION`. Use `IOS_CUCTL_TRANSPORT=usb` to force the original USB tunnel while a Wi-Fi tunnel is running.
 
 Provide a WDA package signed for the target device and set:
 

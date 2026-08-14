@@ -7,6 +7,8 @@ import argparse
 import base64
 import json
 import os
+import pwd
+import re
 import shutil
 import signal
 import struct
@@ -46,6 +48,7 @@ APPIUM_LOG = STATE_DIR / "appium.log"
 TUNNEL_LOG = STATE_DIR / "remotexpc-tunnel.log"
 WDA_RUNNER_FILE = STATE_DIR / "wda-runner.json"
 WDA_RUNNER_LOG = STATE_DIR / "wda-runner.log"
+WIFI_TUNNEL_FILE = STATE_DIR / "wifi-tunnel.json"
 WDA_RUNNER = Path(os.environ.get("IOS_CUCTL_WDA_RUNNER", BRIDGE_DIR / "wda-runner")).expanduser()
 DEFAULT_TUNNEL_REGISTRY_PORT = 42314
 TUNNEL_PORT_FILE = Path(
@@ -141,6 +144,12 @@ def select_device(requested: str | None) -> dict[str, Any]:
 
 
 def device_udid(requested: str | None) -> str:
+    wireless = wifi_rsd_context()
+    if wireless:
+        value = requested or wireless.get("udid")
+        if value:
+            return str(value)
+        raise BridgeError("wireless tunnel state has no UDID; pass --udid")
     device = select_device(requested)
     value = device.get("Identifier") or device.get("UniqueDeviceID")
     if not value:
@@ -223,7 +232,57 @@ def ensure_remote_xpc(udid: str) -> dict[str, Any]:
     return {"port": port, "udid": udid, "tunnel": tunnels[udid]}
 
 
+def requested_transport() -> str:
+    value = os.environ.get("IOS_CUCTL_TRANSPORT", "auto").lower()
+    if value not in {"auto", "usb", "wifi"}:
+        raise BridgeError("IOS_CUCTL_TRANSPORT must be auto, usb, or wifi")
+    return value
+
+
+def wifi_tunnel_alive(state: dict[str, Any] | None = None) -> bool:
+    state = state or read_json_file(WIFI_TUNNEL_FILE)
+    if not state or not state.get("pid"):
+        return False
+    command = process_command(int(state["pid"]))
+    return bool(command and "pymobiledevice3" in command and "start-tunnel" in command and "wifi" in command)
+
+
+def wifi_rsd_context() -> dict[str, Any] | None:
+    if requested_transport() == "usb":
+        return None
+    address = os.environ.get("IOS_CUCTL_RSD_ADDRESS")
+    port_text = os.environ.get("IOS_CUCTL_RSD_PORT")
+    if address or port_text:
+        if not address or not port_text:
+            raise BridgeError("set both IOS_CUCTL_RSD_ADDRESS and IOS_CUCTL_RSD_PORT")
+        try:
+            port = int(port_text)
+        except ValueError as exc:
+            raise BridgeError("IOS_CUCTL_RSD_PORT must be an integer") from exc
+        if not 0 < port < 65536:
+            raise BridgeError("IOS_CUCTL_RSD_PORT must be between 1 and 65535")
+        return {
+            "address": address,
+            "rsd_port": port,
+            "udid": os.environ.get("IOS_CUCTL_WIFI_UDID"),
+            "platform_version": os.environ.get("IOS_CUCTL_WIFI_PLATFORM_VERSION"),
+            "source": "environment",
+        }
+    state = read_json_file(WIFI_TUNNEL_FILE)
+    if state and wifi_tunnel_alive(state):
+        return state
+    if requested_transport() == "wifi":
+        raise BridgeError("Wi-Fi tunnel is not running; run ios-cuctl wifi-tunnel-start")
+    return None
+
+
 def hid_rsd(requested_udid: str | None) -> tuple[str, int, str]:
+    wireless = wifi_rsd_context()
+    if wireless:
+        udid = requested_udid or str(wireless.get("udid") or "")
+        if not udid:
+            raise BridgeError("wireless tunnel state has no UDID; pass --udid")
+        return str(wireless["address"]), int(wireless["rsd_port"]), udid
     udid = device_udid(requested_udid)
     info = ensure_remote_xpc(udid)
     tunnel = info.get("tunnel")
@@ -237,7 +296,12 @@ def hid_rsd(requested_udid: str | None) -> tuple[str, int, str]:
 
 
 def device_major_version(requested_udid: str | None) -> int:
-    version = str(select_device(requested_udid).get("ProductVersion") or "0")
+    wireless = wifi_rsd_context()
+    version = (
+        str(wireless.get("platform_version") or "0")
+        if wireless
+        else str(select_device(requested_udid).get("ProductVersion") or "0")
+    )
     try:
         return int(version.split(".", 1)[0])
     except ValueError:
@@ -577,11 +641,26 @@ def start_session(args: argparse.Namespace) -> None:
         return
     if existing:
         SESSION_FILE.unlink(missing_ok=True)
-    device = select_device(args.udid)
-    udid = str(device.get("Identifier") or device.get("UniqueDeviceID"))
-    platform_version = str(device.get("ProductVersion"))
-    mount_developer_image(udid)
-    tunnel_info = ensure_remote_xpc(udid)
+    wireless = wifi_rsd_context()
+    if wireless:
+        udid = args.udid or str(wireless.get("udid") or "")
+        if not udid:
+            raise BridgeError("wireless tunnel state has no UDID; pass --udid")
+        platform_version = str(wireless.get("platform_version") or "0")
+        tunnel_info = {
+            "udid": udid,
+            "transport": "wifi",
+            "tunnel": {
+                "address": wireless["address"],
+                "rsdPort": wireless["rsd_port"],
+            },
+        }
+    else:
+        device = select_device(args.udid)
+        udid = str(device.get("Identifier") or device.get("UniqueDeviceID"))
+        platform_version = str(device.get("ProductVersion"))
+        mount_developer_image(udid)
+        tunnel_info = ensure_remote_xpc(udid)
     runner_state = start_wda_runner(tunnel_info, args.wda_bundle_id)
     start_server()
     wda_address = str(runner_state["address"])
@@ -591,13 +670,14 @@ def start_session(args: argparse.Namespace) -> None:
         "platformName": "iOS",
         "appium:automationName": "XCUITest",
         "appium:udid": udid,
-        "appium:platformVersion": platform_version,
         "appium:webDriverAgentUrl": wda_url,
         "appium:noReset": True,
         "appium:newCommandTimeout": 3600,
         "appium:wdaLaunchTimeout": 90000,
         "appium:wdaConnectionTimeout": 90000,
     }
+    if platform_version != "0":
+        capabilities["appium:platformVersion"] = platform_version
     if args.bundle_id:
         capabilities["appium:bundleId"] = args.bundle_id
     response = http_json(
@@ -845,6 +925,11 @@ def cmd_doctor(args: argparse.Namespace) -> None:
         if tunnel
         else {"ready": False, "registry_port": read_tunnel_registry_port()}
     )
+    wifi_state = read_json_file(WIFI_TUNNEL_FILE)
+    checks["wifi_tunnel"] = {
+        "ready": wifi_tunnel_alive(wifi_state),
+        "state": wifi_state,
+    }
     print(json.dumps(checks, ensure_ascii=False, indent=2))
 
 
@@ -853,7 +938,8 @@ def cmd_devices(args: argparse.Namespace) -> None:
 
 
 def cmd_info(args: argparse.Namespace) -> None:
-    print(json.dumps(select_device(args.udid), ensure_ascii=False, indent=2))
+    wireless = wifi_rsd_context()
+    print(json.dumps(wireless or select_device(args.udid), ensure_ascii=False, indent=2))
 
 
 def cmd_pair(args: argparse.Namespace) -> None:
@@ -869,6 +955,93 @@ def cmd_wireless_on(args: argparse.Namespace) -> None:
 
 def cmd_wireless_browse(args: argparse.Namespace) -> None:
     pmd3("remote", "browse")
+
+
+def cmd_wifi_tunnel_start(args: argparse.Namespace) -> None:
+    existing = read_json_file(WIFI_TUNNEL_FILE)
+    if wifi_tunnel_alive(existing):
+        print(json.dumps(existing, ensure_ascii=False, indent=2))
+        return
+    if existing:
+        WIFI_TUNNEL_FILE.unlink(missing_ok=True)
+
+    if args.udid:
+        udid = args.udid
+    else:
+        udid = device_udid(None)
+    platform_version = args.platform_version
+    if not platform_version:
+        try:
+            platform_version = str(select_device(udid).get("ProductVersion") or "0")
+        except BridgeError:
+            platform_version = "0"
+
+    account = pwd.getpwuid(os.getuid())
+    command = [
+        "pkexec",
+        "env",
+        f"SUDO_USER={account.pw_name}",
+        f"SUDO_UID={account.pw_uid}",
+        f"SUDO_GID={account.pw_gid}",
+        str(PMD3),
+        "remote",
+        "start-tunnel",
+        "--connection-type",
+        "wifi",
+        "--udid",
+        udid,
+        "--script-mode",
+        "--protocol",
+        args.protocol,
+    ]
+    print(
+        "Starting the privileged Wi-Fi RemoteXPC tunnel; approve the operating-system prompt "
+        "and keep this command running.",
+        flush=True,
+    )
+    process = subprocess.Popen(
+        command,
+        stdin=None,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    state_written = False
+    try:
+        assert process.stdout is not None
+        for line in process.stdout:
+            print(line, end="", flush=True)
+            clean = re.sub(r"\x1b\[[0-9;]*m", "", line).strip()
+            match = re.fullmatch(r"(\S+)\s+(\d+)", clean)
+            if not match or state_written:
+                continue
+            port = int(match.group(2))
+            state = {
+                "pid": process.pid,
+                "address": match.group(1),
+                "rsd_port": port,
+                "udid": udid,
+                "platform_version": platform_version,
+                "protocol": args.protocol,
+                "transport": "wifi",
+                "started": time.time(),
+            }
+            write_json_file(WIFI_TUNNEL_FILE, state)
+            state_written = True
+            print("Wi-Fi tunnel is ready; other ios-cuctl commands now prefer it automatically.", flush=True)
+        returncode = process.wait()
+    finally:
+        current = read_json_file(WIFI_TUNNEL_FILE)
+        if current and int(current.get("pid") or 0) == process.pid:
+            WIFI_TUNNEL_FILE.unlink(missing_ok=True)
+    if returncode != 0:
+        raise BridgeError(f"Wi-Fi tunnel exited with status {returncode}")
+
+
+def cmd_wifi_tunnel_status(args: argparse.Namespace) -> None:
+    state = read_json_file(WIFI_TUNNEL_FILE)
+    print(json.dumps({"ready": wifi_tunnel_alive(state), "state": state}, ensure_ascii=False, indent=2))
 
 
 def cmd_tunnel_status(args: argparse.Namespace) -> None:
@@ -936,7 +1109,19 @@ def cmd_install_wda(args: argparse.Namespace) -> None:
 
 
 def cmd_apps(args: argparse.Namespace) -> None:
-    pmd3("apps", "list", "--type", args.type, "--udid", device_udid(args.udid))
+    wireless = wifi_rsd_context()
+    if wireless:
+        pmd3(
+            "apps",
+            "list",
+            "--type",
+            args.type,
+            "--rsd",
+            str(wireless["address"]),
+            str(wireless["rsd_port"]),
+        )
+    else:
+        pmd3("apps", "list", "--type", args.type, "--udid", device_udid(args.udid))
 
 
 def cmd_start(args: argparse.Namespace) -> None:
@@ -959,7 +1144,16 @@ def cmd_server_stop(args: argparse.Namespace) -> None:
 
 def cmd_wda_start(args: argparse.Namespace) -> None:
     udid = device_udid(args.udid)
-    tunnel_info = ensure_remote_xpc(udid)
+    wireless = wifi_rsd_context()
+    tunnel_info = (
+        {
+            "udid": udid,
+            "transport": "wifi",
+            "tunnel": {"address": wireless["address"], "rsdPort": wireless["rsd_port"]},
+        }
+        if wireless
+        else ensure_remote_xpc(udid)
+    )
     state = start_wda_runner(tunnel_info, args.wda_bundle_id)
     print(json.dumps(state, ensure_ascii=False, indent=2))
 
@@ -1169,6 +1363,17 @@ def build_parser() -> argparse.ArgumentParser:
     add("pair", "Pair the selected unlocked device over USB", cmd_pair)
     add("wireless-on", "Enable Wi-Fi connections and bootstrap RemotePairing", cmd_wireless_on)
     add("wireless-browse", "Browse RemoteXPC devices advertised on the LAN", cmd_wireless_browse)
+    wifi_tunnel = add(
+        "wifi-tunnel-start",
+        "Start a privileged Wi-Fi RemoteXPC tunnel in the foreground",
+        cmd_wifi_tunnel_start,
+    )
+    wifi_tunnel.add_argument("--protocol", choices=["tcp", "quic"], default="tcp")
+    wifi_tunnel.add_argument(
+        "--platform-version",
+        help="iOS version for WDA sessions when the phone is no longer connected over USB",
+    )
+    add("wifi-tunnel-status", "Show bridge-managed Wi-Fi tunnel state", cmd_wifi_tunnel_status)
     tunnel_start = add(
         "tunnel-start",
         "Start the privileged RemoteXPC tunnel in the foreground",

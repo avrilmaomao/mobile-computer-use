@@ -18,6 +18,8 @@ Start with:
 
 Use `"$HOME/android-computer-use/android-cuctl" --help` for the supported command surface. Prefer this constrained command over raw `adb shell`.
 
+For wireless debugging, use `discover` to inspect mDNS advertisements and `connect-auto` only when exactly one already-paired connect target is present. First-time pairing still requires the phone's displayed pairing address and one-time code.
+
 For coordinate-based actions, take a fresh screenshot, inspect it with the available image-viewing tool, act, then take another screenshot to verify the resulting state. Use `ui-dump` when visible labels or bounds help, but do not assume every UI exposes an accessibility tree.
 
 Never bypass a lock screen, biometric prompt, secure-window restriction, or Android permission boundary. Obtain explicit user authorization immediately before consequential actions such as sending messages, placing calls, making purchases, changing accounts or security settings, entering a PIN/password/OTP, installing or removing apps, clearing data, or rebooting a device.

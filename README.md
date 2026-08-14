@@ -4,7 +4,7 @@ Constrained, agent-friendly bridges for inspecting and operating user-authorized
 
 The repository contains two Agent Skills and their home-directory controllers:
 
-- `android-computer-use`: ADB and scrcpy device discovery, screenshots, UI dumps, taps, swipes, text, key events, app launch, and USB/Wi-Fi debugging.
+- `android-computer-use`: ADB and scrcpy device discovery, mDNS auto-connect for a unique paired target, screenshots, UI dumps, taps, swipes, text, key events, app launch, and USB/Wi-Fi debugging.
 - `ios-computer-use`: pymobiledevice3, RemoteXPC, CoreDevice, Appium, and WebDriverAgent screenshots, accessibility inspection, coordinate conversion, input, app activation, and USB/Wi-Fi setup.
 
 Both skills require explicit user authorization around lock screens, credentials, sensitive permissions, purchases, messages, account changes, app installation, and other consequential actions.
@@ -45,7 +45,7 @@ For Claude Code discovery and verification, read [docs/CLAUDE_CODE.md](docs/CLAU
 
 Android requires `adb`; `scrcpy` is required only for live mirroring. The controller can use system commands from `PATH` or an official portable runtime placed under `~/android-computer-use/runtime/`.
 
-iOS requires Python 3, `pymobiledevice3`, Node.js, Appium with the XCUITest driver, a trusted physical device, and a WebDriverAgent IPA signed for that device. iOS signing assets are intentionally not included. Configure the signed IPA and runner bundle ID with `IOS_CUCTL_WDA_IPA` and `IOS_CUCTL_WDA_BUNDLE_ID`.
+iOS requires Python 3, `pymobiledevice3`, Node.js, Appium with the XCUITest driver, a trusted physical device, and a WebDriverAgent IPA signed for that device. iOS signing assets are intentionally not included. Configure the signed IPA and runner bundle ID with `IOS_CUCTL_WDA_IPA` and `IOS_CUCTL_WDA_BUNDLE_ID`. After initial USB pairing, `wifi-tunnel-start` provides a persistent Wi-Fi RemoteXPC path that ordinary bridge commands reuse automatically.
 
 Run the read-only checks after installation:
 

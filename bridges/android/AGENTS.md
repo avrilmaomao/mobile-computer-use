@@ -59,6 +59,15 @@ Prefer Android 11 or newer's **Wireless debugging** pairing flow. Keep the phone
 3. Use the separate address shown on the main Wireless debugging screen with `android-cuctl connect PHONE_IP:DEBUG_PORT`.
 4. Confirm with `android-cuctl devices`.
 
+The host can discover advertised services without copying addresses manually:
+
+```bash
+"$HOME/android-computer-use/android-cuctl" discover
+"$HOME/android-computer-use/android-cuctl" connect-auto
+```
+
+`connect-auto` proceeds only when exactly one already-paired `_adb-tls-connect` target is visible. If multiple targets appear, inspect `discover` and connect the intended address explicitly.
+
 Do not expose legacy unauthenticated ADB-over-TCP port 5555 to a LAN or the Internet.
 
 ## Device selection
