@@ -1,0 +1,207 @@
+#!/usr/bin/env python3
+"""Run pymobiledevice3 tunneld when systemd already grants CAP_NET_ADMIN."""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import logging
+import time
+from contextlib import asynccontextmanager, suppress
+from typing import Any
+
+import fastapi
+from pymobiledevice3.remote.common import TunnelProtocol
+from pymobiledevice3.remote.remote_service_discovery import RemoteServiceDiscoveryService
+from pymobiledevice3.tunneld.server import TunneldRunner
+
+
+LOGGER = logging.getLogger("ios-computer-use.tunneld")
+HEALTH_INTERVAL_SECONDS = 5.0
+HEALTH_CONNECT_TIMEOUT_SECONDS = 3.0
+HEALTH_FAILURE_LIMIT = 2
+
+
+class CompatibleTunneldRunner:
+    """Expose pymobiledevice3 tunnels through both native and Appium APIs."""
+
+    def __init__(self, host: str, port: int, protocol: TunnelProtocol) -> None:
+        self.runner = TunneldRunner(
+            host,
+            port,
+            protocol=protocol,
+            usb_monitor=True,
+            wifi_monitor=True,
+            usbmux_monitor=True,
+            mobdev2_monitor=True,
+        )
+        self._catalog_cache: dict[tuple[str, int], dict[str, Any]] = {}
+        self._catalog_tasks: dict[tuple[str, int], asyncio.Task[dict[str, Any]]] = {}
+        self._health_failures: dict[tuple[str, str, int], int] = {}
+        self._health_first_seen: dict[tuple[str, str, int], float] = {}
+        self._install_appium_routes()
+        self._install_health_watchdog()
+
+    def _active_tunnels(self) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for active in self.runner._tunneld_core.tunnel_tasks.values():
+            if active.udid and active.tunnel and active.udid not in result:
+                result[active.udid] = active.tunnel
+        return result
+
+    async def _tunnel_reachable(self, address: str, port: int) -> bool:
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(address, port),
+                timeout=HEALTH_CONNECT_TIMEOUT_SECONDS,
+            )
+            del reader
+            writer.close()
+            with suppress(Exception):
+                await writer.wait_closed()
+            return True
+        except (OSError, TimeoutError):
+            return False
+
+    async def _health_watchdog(self) -> None:
+        while True:
+            await asyncio.sleep(HEALTH_INTERVAL_SECONDS)
+            active = self._active_tunnels()
+            current_keys: set[tuple[str, str, int]] = set()
+            for udid, tunnel in active.items():
+                key = (udid, str(tunnel.address), int(tunnel.port))
+                current_keys.add(key)
+                first_seen = self._health_first_seen.setdefault(key, time.monotonic())
+                if time.monotonic() - first_seen < HEALTH_INTERVAL_SECONDS:
+                    continue
+                if await self._tunnel_reachable(key[1], key[2]):
+                    self._health_failures.pop(key, None)
+                    continue
+                failures = self._health_failures.get(key, 0) + 1
+                self._health_failures[key] = failures
+                if failures < HEALTH_FAILURE_LIMIT:
+                    continue
+                LOGGER.warning(
+                    "RemoteXPC tunnel for %s is unreachable at %s:%s; rebuilding it",
+                    udid,
+                    key[1],
+                    key[2],
+                )
+                with suppress(KeyError):
+                    self.runner._tunneld_core.cancel(udid)
+                self._health_failures.pop(key, None)
+                self._health_first_seen.pop(key, None)
+
+            stale_keys = set(self._health_first_seen) - current_keys
+            for key in stale_keys:
+                self._health_first_seen.pop(key, None)
+                self._health_failures.pop(key, None)
+
+    def _install_health_watchdog(self) -> None:
+        app = self.runner._app
+        original_lifespan = app.router.lifespan_context
+
+        @asynccontextmanager
+        async def lifespan_with_watchdog(application: fastapi.FastAPI):
+            async with original_lifespan(application):
+                watchdog = asyncio.create_task(self._health_watchdog(), name="remote-xpc-health-watchdog")
+                try:
+                    yield
+                finally:
+                    watchdog.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await watchdog
+
+        app.router.lifespan_context = lifespan_with_watchdog
+
+    async def _discover_catalog(self, address: str, port: int, *, refresh: bool = False) -> dict[str, Any]:
+        key = (address, port)
+        if refresh:
+            self._catalog_cache.pop(key, None)
+        cached = self._catalog_cache.get(key)
+        if cached is not None:
+            return cached
+        existing = self._catalog_tasks.get(key)
+        if existing is not None:
+            return await existing
+
+        async def discover() -> dict[str, Any]:
+            try:
+                async with RemoteServiceDiscoveryService(key) as rsd:
+                    services = {
+                        name: {"port": int(service["Port"])}
+                        for name, service in (rsd.peer_info.get("Services") or {}).items()
+                        if isinstance(service, dict) and service.get("Port")
+                    }
+                    value = {
+                        "services": services,
+                        "productVersion": str(rsd.product_version),
+                    }
+                    self._catalog_cache[key] = value
+                    return value
+            except Exception as exc:
+                LOGGER.warning("could not discover RSD services at %s:%s: %s", address, port, exc)
+                return {"services": {}, "productVersion": "0"}
+            finally:
+                self._catalog_tasks.pop(key, None)
+
+        task = asyncio.create_task(discover())
+        self._catalog_tasks[key] = task
+        return await task
+
+    async def _entry(self, udid: str, tunnel: Any, *, refresh: bool = False) -> dict[str, Any]:
+        catalog = await self._discover_catalog(tunnel.address, tunnel.port, refresh=refresh)
+        return {
+            "udid": udid,
+            "address": tunnel.address,
+            "rsdPort": tunnel.port,
+            "interface": tunnel.interface,
+            "protocol": str(tunnel.protocol.value),
+            **catalog,
+        }
+
+    def _install_appium_routes(self) -> None:
+        app = self.runner._app
+
+        @app.get("/remotexpc/tunnels")
+        async def appium_registry() -> dict[str, Any]:
+            tunnels = self._active_tunnels()
+            entries = await asyncio.gather(*(self._entry(udid, tunnel) for udid, tunnel in tunnels.items()))
+            return {
+                "tunnels": dict(zip(tunnels, entries)),
+                "metadata": {
+                    "totalTunnels": len(entries),
+                    "activeTunnels": len(entries),
+                },
+            }
+
+        @app.get("/remotexpc/tunnels/{udid}")
+        async def appium_tunnel(udid: str, waitMs: int = 0) -> dict[str, Any]:
+            del waitMs
+            tunnel = self._active_tunnels().get(udid)
+            if tunnel is None:
+                raise fastapi.HTTPException(status_code=404, detail=f"Tunnel not found for UDID: {udid}")
+            return await self._entry(udid, tunnel)
+
+        @app.post("/remotexpc/tunnels/{udid}/refresh-services")
+        async def appium_refresh_services(udid: str) -> dict[str, Any]:
+            tunnel = self._active_tunnels().get(udid)
+            if tunnel is None:
+                raise fastapi.HTTPException(status_code=404, detail=f"Tunnel not found for UDID: {udid}")
+            return await self._entry(udid, tunnel, refresh=True)
+
+    def run(self) -> None:
+        self.runner._run_app()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=49151)
+    parser.add_argument("--protocol", choices=("tcp", "quic"), default="tcp")
+    args = parser.parse_args()
+    CompatibleTunneldRunner(args.host, args.port, TunnelProtocol(args.protocol)).run()
+
+
+if __name__ == "__main__":
+    main()
