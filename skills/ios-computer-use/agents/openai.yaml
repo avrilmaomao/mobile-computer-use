@@ -1,0 +1,4 @@
+interface:
+  display_name: "iOS Computer Use"
+  short_description: "Control authorized physical iOS devices from Linux"
+  default_prompt: "Use $ios-computer-use to inspect and operate my connected iPhone from this Linux host."

@@ -1,0 +1,13 @@
+**/__pycache__/
+**/captures/
+**/verification/
+**/runtime/
+*.ipa
+*.mobileprovision
+*.p12
+*.pem
+*.key
+*.png
+*.xml
+.env
+.DS_Store

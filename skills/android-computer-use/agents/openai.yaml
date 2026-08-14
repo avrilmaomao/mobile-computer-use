@@ -1,0 +1,4 @@
+interface:
+  display_name: "Android Computer Use"
+  short_description: "Safely inspect and control Android devices over ADB"
+  default_prompt: "Use $android-computer-use to inspect and operate my Android device safely."

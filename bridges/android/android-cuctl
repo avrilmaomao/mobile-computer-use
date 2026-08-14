@@ -1,0 +1,290 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+core_dir="${ANDROID_CUCTL_HOME:-$script_dir}"
+capture_dir="$core_dir/captures"
+runtime_dir="$core_dir/runtime"
+
+if [[ -x "$runtime_dir/adb" && -x "$runtime_dir/scrcpy" ]]; then
+  export PATH="$runtime_dir:$PATH"
+fi
+
+usage() {
+  cat <<'EOF'
+Usage: android-cuctl COMMAND [ARGS...]
+
+Connection and status:
+  doctor                         Check host tools and list ADB devices
+  devices                        List attached and paired ADB devices
+  pair HOST:PORT                 Pair using Android 11+ Wireless debugging
+  connect HOST[:PORT]            Connect to a paired wireless device
+  disconnect [HOST[:PORT]]       Disconnect one or all wireless devices
+  serial                         Print the selected authorized device serial
+  info                           Print basic selected-device information
+
+Inspection:
+  screenshot [FILE]              Save a PNG and print its absolute path
+  ui-dump [FILE]                 Save a UIAutomator XML dump and print its path
+  size                           Print the physical/override display size
+  current                        Print the current focused app/window
+
+Input:
+  tap X Y                        Tap screen coordinates
+  swipe X1 Y1 X2 Y2 [MS]         Swipe between coordinates
+  key KEYCODE                    Send a numeric or KEYCODE_* key event
+  text-ascii TEXT                Type conservative ASCII; spaces are supported
+  launch PACKAGE                 Launch an installed app by package name
+
+Viewing:
+  mirror [SCRCPY_ARGS...]        Open scrcpy for the selected device
+
+Set ANDROID_SERIAL to select an exact authorized device when multiple devices
+are present. Relative output FILE names are stored under:
+  $ANDROID_CUCTL_HOME/captures (default: the controller's captures directory)
+EOF
+}
+
+fail() {
+  printf 'android-cuctl: %s\n' "$*" >&2
+  exit 1
+}
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || fail "missing '$1'; read $core_dir/AGENTS.md"
+}
+
+selected_serial() {
+  need_cmd adb
+
+  if [[ -n "${ANDROID_SERIAL:-}" ]]; then
+    local state
+    state="$(adb -s "$ANDROID_SERIAL" get-state 2>/dev/null || true)"
+    [[ "$state" == "device" ]] || fail "ANDROID_SERIAL '$ANDROID_SERIAL' is not an authorized online device"
+    printf '%s\n' "$ANDROID_SERIAL"
+    return
+  fi
+
+  local -a serials=()
+  mapfile -t serials < <(adb devices | awk 'NR > 1 && $2 == "device" { print $1 }')
+
+  case "${#serials[@]}" in
+    0)
+      fail "no authorized online device; run 'android-cuctl devices' and check the phone's RSA prompt"
+      ;;
+    1)
+      printf '%s\n' "${serials[0]}"
+      ;;
+    *)
+      fail "multiple authorized devices; set ANDROID_SERIAL to the intended serial"
+      ;;
+  esac
+}
+
+adb_device() {
+  local serial
+  serial="$(selected_serial)"
+  adb -s "$serial" "$@"
+}
+
+output_path() {
+  local kind="$1"
+  local extension="$2"
+  local requested="${3:-}"
+
+  mkdir -p "$capture_dir"
+  if [[ -z "$requested" ]]; then
+    printf '%s/%s-%s.%s\n' "$capture_dir" "$kind" "$(date +%Y%m%d-%H%M%S-%N)" "$extension"
+  elif [[ "$requested" == /* ]]; then
+    printf '%s\n' "$requested"
+  else
+    printf '%s/%s\n' "$capture_dir" "$requested"
+  fi
+}
+
+require_uint() {
+  [[ "$1" =~ ^[0-9]+$ ]] || fail "expected a non-negative integer, got '$1'"
+}
+
+command="${1:---help}"
+if [[ $# -gt 0 ]]; then
+  shift
+fi
+
+case "$command" in
+  -h|--help|help)
+    usage
+    ;;
+
+  doctor)
+    printf 'Core: %s\n' "$core_dir"
+    printf 'User: %s\n' "$(id -un)"
+    if id -nG | tr ' ' '\n' | grep -qx plugdev; then
+      printf 'plugdev group: yes\n'
+    else
+      printf 'plugdev group: no (USB access may fail)\n'
+    fi
+
+    missing=0
+    for tool in adb scrcpy; do
+      if command -v "$tool" >/dev/null 2>&1; then
+        printf '%s: %s\n' "$tool" "$(command -v "$tool")"
+      else
+        printf '%s: missing\n' "$tool"
+        missing=1
+      fi
+    done
+
+    if dpkg-query -W -f='${Status}' android-udev-rules 2>/dev/null | grep -q 'install ok installed'; then
+      printf 'Android USB rules: installed\n'
+    else
+      printf 'Android USB rules: not detected\n'
+    fi
+
+    if command -v adb >/dev/null 2>&1; then
+      printf '\nADB devices:\n'
+      adb devices -l
+    fi
+
+    [[ "$missing" -eq 0 ]] || fail "install the missing host tools; read $core_dir/AGENTS.md"
+    ;;
+
+  devices)
+    need_cmd adb
+    adb devices -l
+    ;;
+
+  pair)
+    [[ $# -eq 1 ]] || fail "usage: android-cuctl pair HOST:PORT"
+    need_cmd adb
+    [[ "$1" =~ ^[^[:space:]:]+:[0-9]+$ ]] || fail "expected HOST:PORT from Android's pairing screen"
+    adb pair "$1"
+    ;;
+
+  connect)
+    [[ $# -eq 1 ]] || fail "usage: android-cuctl connect HOST[:PORT]"
+    need_cmd adb
+    [[ "$1" != *[[:space:]]* ]] || fail "host must not contain whitespace"
+    adb connect "$1"
+    ;;
+
+  disconnect)
+    [[ $# -le 1 ]] || fail "usage: android-cuctl disconnect [HOST[:PORT]]"
+    need_cmd adb
+    if [[ $# -eq 1 ]]; then
+      [[ "$1" != *[[:space:]]* ]] || fail "host must not contain whitespace"
+      adb disconnect "$1"
+    else
+      adb disconnect
+    fi
+    ;;
+
+  serial)
+    [[ $# -eq 0 ]] || fail "usage: android-cuctl serial"
+    selected_serial
+    ;;
+
+  info)
+    [[ $# -eq 0 ]] || fail "usage: android-cuctl info"
+    serial="$(selected_serial)"
+    printf 'serial: %s\n' "$serial"
+    printf 'manufacturer: %s\n' "$(adb -s "$serial" shell getprop ro.product.manufacturer | tr -d '\r')"
+    printf 'model: %s\n' "$(adb -s "$serial" shell getprop ro.product.model | tr -d '\r')"
+    printf 'android: %s (SDK %s)\n' \
+      "$(adb -s "$serial" shell getprop ro.build.version.release | tr -d '\r')" \
+      "$(adb -s "$serial" shell getprop ro.build.version.sdk | tr -d '\r')"
+    adb -s "$serial" shell wm size | tr -d '\r'
+    ;;
+
+  screenshot)
+    [[ $# -le 1 ]] || fail "usage: android-cuctl screenshot [FILE]"
+    target="$(output_path screenshot png "${1:-}")"
+    [[ ! -e "$target" ]] || fail "refusing to overwrite existing file '$target'"
+    mkdir -p "$(dirname "$target")"
+    serial="$(selected_serial)"
+    adb -s "$serial" exec-out screencap -p >"$target"
+    [[ -s "$target" ]] || fail "device returned an empty screenshot"
+    printf '%s\n' "$target"
+    ;;
+
+  ui-dump)
+    [[ $# -le 1 ]] || fail "usage: android-cuctl ui-dump [FILE]"
+    target="$(output_path ui xml "${1:-}")"
+    [[ ! -e "$target" ]] || fail "refusing to overwrite existing file '$target'"
+    mkdir -p "$(dirname "$target")"
+    serial="$(selected_serial)"
+    remote="/data/local/tmp/android-cuctl-$$.xml"
+    adb -s "$serial" shell uiautomator dump "$remote" >/dev/null
+    adb -s "$serial" exec-out cat "$remote" >"$target"
+    adb -s "$serial" shell rm -f "$remote" >/dev/null
+    [[ -s "$target" ]] || fail "device returned an empty UI dump"
+    printf '%s\n' "$target"
+    ;;
+
+  size)
+    [[ $# -eq 0 ]] || fail "usage: android-cuctl size"
+    adb_device shell wm size | tr -d '\r'
+    ;;
+
+  current)
+    [[ $# -eq 0 ]] || fail "usage: android-cuctl current"
+    serial="$(selected_serial)"
+    focus="$(adb -s "$serial" shell dumpsys window 2>/dev/null | grep -E 'mCurrentFocus|mFocusedApp' | head -n 2 | tr -d '\r' || true)"
+    if [[ -n "$focus" ]]; then
+      printf '%s\n' "$focus"
+    else
+      adb -s "$serial" shell dumpsys activity activities 2>/dev/null \
+        | grep -m 1 'mResumedActivity' | tr -d '\r' || true
+    fi
+    ;;
+
+  tap)
+    [[ $# -eq 2 ]] || fail "usage: android-cuctl tap X Y"
+    require_uint "$1"
+    require_uint "$2"
+    adb_device shell input tap "$1" "$2"
+    ;;
+
+  swipe)
+    [[ $# -eq 4 || $# -eq 5 ]] || fail "usage: android-cuctl swipe X1 Y1 X2 Y2 [MS]"
+    require_uint "$1"
+    require_uint "$2"
+    require_uint "$3"
+    require_uint "$4"
+    if [[ $# -eq 5 ]]; then
+      require_uint "$5"
+      adb_device shell input swipe "$1" "$2" "$3" "$4" "$5"
+    else
+      adb_device shell input swipe "$1" "$2" "$3" "$4"
+    fi
+    ;;
+
+  key)
+    [[ $# -eq 1 ]] || fail "usage: android-cuctl key KEYCODE"
+    [[ "$1" =~ ^([0-9]+|KEYCODE_[A-Z0-9_]+)$ ]] || fail "use a numeric key code or KEYCODE_* name"
+    adb_device shell input keyevent "$1"
+    ;;
+
+  text-ascii)
+    [[ $# -eq 1 ]] || fail "usage: android-cuctl text-ascii TEXT"
+    [[ "$1" =~ ^[A-Za-z0-9._@:/\ -]*$ ]] || fail "text-ascii accepts only letters, digits, spaces, and . _ @ : / -"
+    encoded="${1// /%s}"
+    adb_device shell input text "$encoded"
+    ;;
+
+  launch)
+    [[ $# -eq 1 ]] || fail "usage: android-cuctl launch PACKAGE"
+    [[ "$1" =~ ^[A-Za-z0-9._]+$ ]] || fail "invalid Android package name"
+    adb_device shell monkey -p "$1" -c android.intent.category.LAUNCHER 1 >/dev/null
+    ;;
+
+  mirror)
+    need_cmd scrcpy
+    serial="$(selected_serial)"
+    scrcpy --serial "$serial" "$@"
+    ;;
+
+  *)
+    fail "unknown command '$command'; run android-cuctl --help"
+    ;;
+esac

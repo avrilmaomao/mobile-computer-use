@@ -1,0 +1,32 @@
+#!/usr/bin/env python3
+"""Keep an XCTest-managed WebDriverAgent runner alive over an existing RSD tunnel."""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import logging
+
+from pymobiledevice3.remote.remote_service_discovery import RemoteServiceDiscoveryService
+from pymobiledevice3.services.dvt.testmanaged.xcuitest import TestConfig, XCUITestService
+
+
+async def run(address: str, port: int, bundle_id: str) -> None:
+    async with RemoteServiceDiscoveryService((address, port)) as rsd:
+        config = await TestConfig.create_for(rsd, runner_bundle_id=bundle_id)
+        logging.info("Starting XCTest plan for %s via --rsd %s %s", bundle_id, address, port)
+        await XCUITestService(rsd).run(config)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--address", required=True)
+    parser.add_argument("--rsd-port", required=True, type=int)
+    parser.add_argument("--bundle-id", required=True)
+    args = parser.parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    asyncio.run(run(args.address, args.rsd_port, args.bundle_id))
+
+
+if __name__ == "__main__":
+    main()

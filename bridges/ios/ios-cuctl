@@ -1,0 +1,1256 @@
+#!/usr/bin/env python3
+"""Constrained bridge for a user-authorized physical iOS device on this host."""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import os
+import shutil
+import signal
+import struct
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+
+HOME_DIR = Path.home()
+BRIDGE_DIR = Path(os.environ.get("IOS_CUCTL_HOME", HOME_DIR / "ios-computer-use")).expanduser()
+SHARE_DIR = Path(
+    os.environ.get("IOS_CUCTL_SHARE_DIR", HOME_DIR / ".local/share/ios-computer-use")
+).expanduser()
+STATE_DIR = Path(
+    os.environ.get("IOS_CUCTL_STATE_DIR", HOME_DIR / ".local/state/ios-computer-use")
+).expanduser()
+PMD3 = Path(
+    os.environ.get("IOS_CUCTL_PMD3")
+    or shutil.which("pymobiledevice3")
+    or HOME_DIR / ".local/bin/pymobiledevice3"
+).expanduser()
+DEFAULT_WDA_BUNDLE_ID = os.environ.get(
+    "IOS_CUCTL_WDA_BUNDLE_ID", "com.facebook.WebDriverAgentRunner.xctrunner"
+)
+DEFAULT_WDA_IPA = Path(
+    os.environ.get("IOS_CUCTL_WDA_IPA")
+    or SHARE_DIR / "artifacts/WebDriverAgentRunner.ipa"
+).expanduser()
+APPIUM_URL = os.environ.get("IOS_CUCTL_APPIUM_URL", "http://127.0.0.1:4723")
+SESSION_FILE = STATE_DIR / "session.json"
+SERVER_FILE = STATE_DIR / "server.json"
+APPIUM_LOG = STATE_DIR / "appium.log"
+TUNNEL_LOG = STATE_DIR / "remotexpc-tunnel.log"
+WDA_RUNNER_FILE = STATE_DIR / "wda-runner.json"
+WDA_RUNNER_LOG = STATE_DIR / "wda-runner.log"
+WDA_RUNNER = Path(os.environ.get("IOS_CUCTL_WDA_RUNNER", BRIDGE_DIR / "wda-runner")).expanduser()
+DEFAULT_TUNNEL_REGISTRY_PORT = 42314
+TUNNEL_PORT_FILE = Path(
+    os.environ.get(
+        "IOS_CUCTL_TUNNEL_PORT_FILE",
+        HOME_DIR / ".local/share/appium-xcuitest-driver-nodejs/strongbox/tunnelRegistryPort",
+    )
+).expanduser()
+
+
+class BridgeError(RuntimeError):
+    pass
+
+
+def die(message: str, code: int = 1) -> None:
+    print(f"error: {message}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def ensure_state_dir() -> None:
+    STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+
+def run(cmd: list[str], *, capture: bool = False, check: bool = True) -> subprocess.CompletedProcess[str]:
+    result = subprocess.run(cmd, text=True, capture_output=capture)
+    if check and result.returncode != 0:
+        if capture:
+            if result.stdout:
+                print(result.stdout, end="", file=sys.stderr)
+            if result.stderr:
+                print(result.stderr, end="", file=sys.stderr)
+        raise BridgeError(f"command failed ({result.returncode}): {' '.join(cmd)}")
+    return result
+
+
+def pmd3(*args: str, capture: bool = False, check: bool = True) -> subprocess.CompletedProcess[str]:
+    if not PMD3.is_file():
+        raise BridgeError(f"pymobiledevice3 is missing: {PMD3}")
+    return run([str(PMD3), *args], capture=capture, check=check)
+
+
+def wda_python() -> Path:
+    configured = os.environ.get("IOS_CUCTL_WDA_PYTHON")
+    if configured:
+        candidate = Path(configured).expanduser()
+        if candidate.is_file():
+            return candidate
+        raise BridgeError(f"configured WDA Python is missing: {candidate}")
+    try:
+        first_line = PMD3.open("r", encoding="utf-8", errors="replace").readline().strip()
+    except OSError:
+        first_line = ""
+    if first_line.startswith("#!"):
+        candidate = Path(first_line[2:].split()[0])
+        if candidate.is_file():
+            return candidate
+    return Path(sys.executable)
+
+
+def usb_devices() -> list[dict[str, Any]]:
+    result = pmd3("usbmux", "list", capture=True)
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise BridgeError(f"could not parse device list: {exc}") from exc
+    if not isinstance(data, list):
+        raise BridgeError("unexpected device-list response")
+    return data
+
+
+def normalize_udid(value: str) -> str:
+    return value.replace("-", "").lower()
+
+
+def select_device(requested: str | None) -> dict[str, Any]:
+    devices = usb_devices()
+    if requested:
+        wanted = normalize_udid(requested)
+        matches = [
+            item
+            for item in devices
+            if normalize_udid(str(item.get("Identifier") or item.get("UniqueDeviceID") or "")) == wanted
+        ]
+        if len(matches) != 1:
+            raise BridgeError(f"USB device not found for UDID {requested}")
+        return matches[0]
+    if not devices:
+        raise BridgeError("no trusted USB iOS device found; unlock it and reconnect USB")
+    if len(devices) > 1:
+        ids = ", ".join(str(x.get("Identifier")) for x in devices)
+        raise BridgeError(f"multiple devices found; pass --udid. Devices: {ids}")
+    return devices[0]
+
+
+def device_udid(requested: str | None) -> str:
+    device = select_device(requested)
+    value = device.get("Identifier") or device.get("UniqueDeviceID")
+    if not value:
+        raise BridgeError("selected device has no UDID")
+    return str(value)
+
+
+def read_json_file(path: Path) -> dict[str, Any] | None:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, json.JSONDecodeError) as exc:
+        raise BridgeError(f"could not read state {path}: {exc}") from exc
+
+
+def write_json_file(path: Path, data: dict[str, Any]) -> None:
+    ensure_state_dir()
+    temp = path.with_suffix(path.suffix + ".tmp")
+    temp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temp.chmod(0o600)
+    temp.replace(path)
+
+
+def write_tunnel_registry_port(port: int) -> None:
+    """Publish root-owned tunnel metadata where the user-owned Appium can read it."""
+    TUNNEL_PORT_FILE.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    temp = TUNNEL_PORT_FILE.with_suffix(".tmp")
+    temp.write_text(str(port), encoding="utf-8")
+    temp.chmod(0o600)
+    temp.replace(TUNNEL_PORT_FILE)
+
+
+def read_tunnel_registry_port() -> int | None:
+    try:
+        value = int(TUNNEL_PORT_FILE.read_text(encoding="utf-8").strip())
+    except (FileNotFoundError, OSError, ValueError):
+        return None
+    return value if 0 < value < 65536 else None
+
+
+def tunnel_registry(port: int, *, timeout: float = 2.0) -> dict[str, Any] | None:
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{port}/remotexpc/tunnels",
+        method="GET",
+        headers={"Accept": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            parsed = json.loads(response.read())
+    except (urllib.error.URLError, json.JSONDecodeError, TimeoutError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def active_tunnel_registry() -> tuple[int, dict[str, Any]] | None:
+    candidates = [read_tunnel_registry_port(), DEFAULT_TUNNEL_REGISTRY_PORT]
+    for port in dict.fromkeys(x for x in candidates if x is not None):
+        data = tunnel_registry(port)
+        if data is not None:
+            if port != read_tunnel_registry_port():
+                write_tunnel_registry_port(port)
+            return port, data
+    return None
+
+
+def ensure_remote_xpc(udid: str) -> dict[str, Any]:
+    active = active_tunnel_registry()
+    if active is None:
+        raise BridgeError(
+            "RemoteXPC tunnel is not running; run 'ios-cuctl tunnel-start' and approve the one-time privilege prompt"
+        )
+    port, data = active
+    tunnels = data.get("tunnels")
+    if not isinstance(tunnels, dict) or udid not in tunnels:
+        raise BridgeError(f"RemoteXPC registry on port {port} has no tunnel for device {udid}")
+    # The root tunnel process and user Appium use separate HOME directories.
+    # Keep the user's Strongbox pointer synchronized before session creation.
+    write_tunnel_registry_port(port)
+    return {"port": port, "udid": udid, "tunnel": tunnels[udid]}
+
+
+def hid_rsd(requested_udid: str | None) -> tuple[str, int, str]:
+    udid = device_udid(requested_udid)
+    info = ensure_remote_xpc(udid)
+    tunnel = info.get("tunnel")
+    if not isinstance(tunnel, dict):
+        raise BridgeError("RemoteXPC registry returned invalid HID tunnel metadata")
+    address = str(tunnel.get("address") or "")
+    rsd_port = int(tunnel.get("rsdPort") or 0)
+    if not address or not rsd_port:
+        raise BridgeError("RemoteXPC tunnel metadata lacks address or RSD port")
+    return address, rsd_port, udid
+
+
+def device_major_version(requested_udid: str | None) -> int:
+    version = str(select_device(requested_udid).get("ProductVersion") or "0")
+    try:
+        return int(version.split(".", 1)[0])
+    except ValueError:
+        return 0
+
+
+def coredevice_touch_supported(requested_udid: str | None) -> bool:
+    # The device-side CoreDevice service returns error 9021 on iOS 26:
+    # "Remote control requires iOS 27.0 or later on this device."
+    return device_major_version(requested_udid) >= 27
+
+
+def ensure_wda_session(requested_udid: str | None) -> None:
+    if session_is_alive(session_state(required=False)):
+        return
+    start_session(
+        argparse.Namespace(
+            udid=requested_udid,
+            bundle_id=None,
+            wda_bundle_id=DEFAULT_WDA_BUNDLE_ID,
+        )
+    )
+
+
+def process_command(pid: int) -> str | None:
+    try:
+        return Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode(
+            "utf-8", errors="replace"
+        )
+    except OSError:
+        return None
+
+
+def wda_runner_alive(state: dict[str, Any] | None = None) -> bool:
+    state = state or read_json_file(WDA_RUNNER_FILE)
+    if not state or not state.get("pid"):
+        return False
+    command = process_command(int(state["pid"]))
+    return bool(command and str(WDA_RUNNER) in command)
+
+
+def wda_status_via_rsd(address: str, rsd_port: int, *, timeout: float = 3.0) -> bool:
+    result = pmd3(
+        "developer",
+        "wda",
+        "status",
+        "--rsd",
+        address,
+        str(rsd_port),
+        "--timeout",
+        str(timeout),
+        capture=True,
+        check=False,
+    )
+    return result.returncode == 0 and '"ready": true' in result.stdout
+
+
+def start_wda_runner(tunnel_info: dict[str, Any], bundle_id: str) -> dict[str, Any]:
+    tunnel = tunnel_info.get("tunnel")
+    if not isinstance(tunnel, dict):
+        raise BridgeError("RemoteXPC registry returned invalid tunnel metadata")
+    address = str(tunnel.get("address") or "")
+    rsd_port = int(tunnel.get("rsdPort") or 0)
+    if not address or not rsd_port:
+        raise BridgeError("RemoteXPC tunnel metadata lacks address or RSD port")
+
+    state = read_json_file(WDA_RUNNER_FILE)
+    if wda_runner_alive(state) and wda_status_via_rsd(address, rsd_port):
+        assert state is not None
+        state["ready"] = True
+        return state
+    if state:
+        WDA_RUNNER_FILE.unlink(missing_ok=True)
+
+    if not WDA_RUNNER.is_file():
+        raise BridgeError(f"WDA runner helper is missing: {WDA_RUNNER}")
+    ensure_state_dir()
+    log_handle = WDA_RUNNER_LOG.open("ab", buffering=0)
+    process = subprocess.Popen(
+        [
+            str(wda_python()),
+            str(WDA_RUNNER),
+            "--address",
+            address,
+            "--rsd-port",
+            str(rsd_port),
+            "--bundle-id",
+            bundle_id,
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=log_handle,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    log_handle.close()
+    state = {
+        "pid": process.pid,
+        "address": address,
+        "rsd_port": rsd_port,
+        "bundle_id": bundle_id,
+        "log": str(WDA_RUNNER_LOG),
+        "started": time.time(),
+    }
+    write_json_file(WDA_RUNNER_FILE, state)
+    deadline = time.monotonic() + 45.0
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            tail = WDA_RUNNER_LOG.read_text(encoding="utf-8", errors="replace")[-5000:]
+            WDA_RUNNER_FILE.unlink(missing_ok=True)
+            raise BridgeError(f"XCTest WDA runner exited during startup\n{tail}")
+        if wda_status_via_rsd(address, rsd_port):
+            state["ready"] = True
+            write_json_file(WDA_RUNNER_FILE, state)
+            return state
+        time.sleep(0.25)
+    raise BridgeError(f"WDA did not become ready; inspect {WDA_RUNNER_LOG}")
+
+
+def stop_wda_runner() -> None:
+    state = read_json_file(WDA_RUNNER_FILE)
+    if not state or not state.get("pid"):
+        print("XCTest WDA runner is not running")
+        return
+    pid = int(state["pid"])
+    command = process_command(pid)
+    if not command:
+        WDA_RUNNER_FILE.unlink(missing_ok=True)
+        print("XCTest WDA runner was already stopped")
+        return
+    if str(WDA_RUNNER) not in command:
+        raise BridgeError(f"PID {pid} is not the bridge WDA runner; refusing to signal it")
+    os.kill(pid, signal.SIGTERM)
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline and process_command(pid):
+        time.sleep(0.1)
+    WDA_RUNNER_FILE.unlink(missing_ok=True)
+    print("XCTest WDA runner stopped")
+
+
+def http_json(
+    method: str,
+    path: str,
+    payload: dict[str, Any] | None = None,
+    *,
+    timeout: float = 60.0,
+) -> dict[str, Any]:
+    data = None
+    headers = {"Accept": "application/json"}
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(APPIUM_URL + path, data=data, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            body = response.read()
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise BridgeError(f"Appium HTTP {exc.code}: {body}") from exc
+    except urllib.error.URLError as exc:
+        raise BridgeError(f"Appium is unavailable at {APPIUM_URL}: {exc.reason}") from exc
+    if not body:
+        return {}
+    try:
+        parsed = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise BridgeError(f"Appium returned invalid JSON: {body[:300]!r}") from exc
+    value = parsed.get("value") if isinstance(parsed, dict) else None
+    if isinstance(value, dict) and value.get("error"):
+        raise BridgeError(str(value.get("message") or value.get("error")))
+    if not isinstance(parsed, dict):
+        raise BridgeError("Appium returned a non-object response")
+    return parsed
+
+
+def appium_ready() -> bool:
+    try:
+        data = http_json("GET", "/status", timeout=2.0)
+    except BridgeError:
+        return False
+    value = data.get("value")
+    return bool(isinstance(value, dict) and value.get("ready", True))
+
+
+def latest_versioned_dir(pattern: str) -> Path:
+    candidates = sorted(SHARE_DIR.glob(pattern))
+    if not candidates:
+        raise BridgeError(f"missing dependency under {SHARE_DIR}: {pattern}")
+    return candidates[-1]
+
+
+def appium_paths() -> tuple[Path, Path]:
+    configured_appium = os.environ.get("IOS_CUCTL_APPIUM_BIN")
+    portable_appium_dirs = sorted(SHARE_DIR.glob("tools/appium-*"))
+    if configured_appium:
+        appium_bin = Path(configured_appium).expanduser()
+    elif portable_appium_dirs:
+        appium_bin = portable_appium_dirs[-1] / "node_modules/.bin/appium"
+    else:
+        discovered_appium = shutil.which("appium")
+        appium_bin = Path(discovered_appium) if discovered_appium else Path("appium")
+    if not appium_bin.is_file():
+        raise BridgeError(
+            "Appium executable is missing; install Appium with the XCUITest driver or set "
+            "IOS_CUCTL_APPIUM_BIN"
+        )
+
+    configured_node_bin = os.environ.get("IOS_CUCTL_NODE_BIN_DIR")
+    portable_node_dirs = sorted(SHARE_DIR.glob("tools/node-v*-linux-x64"))
+    if configured_node_bin:
+        node_bin_dir = Path(configured_node_bin).expanduser()
+    elif portable_node_dirs:
+        node_bin_dir = portable_node_dirs[-1] / "bin"
+    else:
+        discovered_node = shutil.which("node")
+        if not discovered_node:
+            raise BridgeError("Node.js is missing; install it or set IOS_CUCTL_NODE_BIN_DIR")
+        node_bin_dir = Path(discovered_node).parent
+    return node_bin_dir, appium_bin
+
+
+def start_server() -> dict[str, Any]:
+    if appium_ready():
+        state = read_json_file(SERVER_FILE) or {}
+        state["ready"] = True
+        state["url"] = APPIUM_URL
+        return state
+    node_bin_dir, appium_bin = appium_paths()
+    ensure_state_dir()
+    env = os.environ.copy()
+    env["PATH"] = f"{node_bin_dir}:{env.get('PATH', '')}"
+    env["APPIUM_HOME"] = str(SHARE_DIR / "appium-home")
+    log_handle = APPIUM_LOG.open("ab", buffering=0)
+    process = subprocess.Popen(
+        [str(appium_bin), "--address", "127.0.0.1", "--port", "4723", "--log-timestamp"],
+        stdin=subprocess.DEVNULL,
+        stdout=log_handle,
+        stderr=subprocess.STDOUT,
+        env=env,
+        start_new_session=True,
+    )
+    log_handle.close()
+    state = {"pid": process.pid, "url": APPIUM_URL, "log": str(APPIUM_LOG), "started": time.time()}
+    write_json_file(SERVER_FILE, state)
+    deadline = time.monotonic() + 45.0
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            tail = APPIUM_LOG.read_text(encoding="utf-8", errors="replace")[-3000:]
+            raise BridgeError(f"Appium exited during startup\n{tail}")
+        if appium_ready():
+            state["ready"] = True
+            write_json_file(SERVER_FILE, state)
+            return state
+        time.sleep(0.25)
+    raise BridgeError(f"Appium did not become ready; inspect {APPIUM_LOG}")
+
+
+def stop_server() -> None:
+    state = read_json_file(SERVER_FILE)
+    if not state or not state.get("pid"):
+        if appium_ready():
+            raise BridgeError("Appium is running but was not started by ios-cuctl; refusing to stop it")
+        print("Appium server is not running")
+        return
+    pid = int(state["pid"])
+    proc_cmdline = Path(f"/proc/{pid}/cmdline")
+    if not proc_cmdline.exists():
+        SERVER_FILE.unlink(missing_ok=True)
+        print("Appium server was already stopped")
+        return
+    command = proc_cmdline.read_bytes().replace(b"\0", b" ").decode("utf-8", errors="replace")
+    if "appium" not in command or "127.0.0.1" not in command:
+        raise BridgeError(f"PID {pid} no longer looks like this bridge's Appium server; refusing to signal it")
+    os.kill(pid, signal.SIGTERM)
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline and proc_cmdline.exists():
+        time.sleep(0.1)
+    if proc_cmdline.exists():
+        raise BridgeError(f"Appium PID {pid} did not exit after SIGTERM")
+    SERVER_FILE.unlink(missing_ok=True)
+    print("Appium server stopped")
+
+
+def session_state(required: bool = True) -> dict[str, Any] | None:
+    state = read_json_file(SESSION_FILE)
+    if not state:
+        if required:
+            raise BridgeError("no active iOS session; run ios-cuctl start first")
+        return None
+    return state
+
+
+def session_id() -> str:
+    state = session_state()
+    assert state is not None
+    value = state.get("session_id")
+    if not value:
+        raise BridgeError("session state has no session id")
+    return str(value)
+
+
+def session_request(
+    method: str,
+    suffix: str,
+    payload: dict[str, Any] | None = None,
+    *,
+    timeout: float = 60.0,
+) -> dict[str, Any]:
+    return http_json(method, f"/session/{session_id()}{suffix}", payload, timeout=timeout)
+
+
+def session_is_alive(state: dict[str, Any] | None = None) -> bool:
+    if not state or not state.get("session_id") or not appium_ready():
+        return False
+    try:
+        http_json("GET", f"/session/{state['session_id']}", timeout=3.0)
+    except BridgeError:
+        return False
+    return True
+
+
+def mount_developer_image(udid: str) -> None:
+    result = pmd3("mounter", "auto-mount", "--userspace", "--udid", udid, capture=True, check=False)
+    if result.returncode != 0:
+        combined = (result.stdout or "") + (result.stderr or "")
+        if "DeviceLocked" in combined:
+            raise BridgeError("the iPhone is locked; unlock it, keep the screen on, and retry")
+        print(combined, end="", file=sys.stderr)
+        raise BridgeError("failed to mount the developer image")
+    if result.stdout:
+        print(result.stdout, end="")
+
+
+def start_session(args: argparse.Namespace) -> None:
+    existing = session_state(required=False)
+    if session_is_alive(existing):
+        print(json.dumps(existing, ensure_ascii=False, indent=2))
+        return
+    if existing:
+        SESSION_FILE.unlink(missing_ok=True)
+    device = select_device(args.udid)
+    udid = str(device.get("Identifier") or device.get("UniqueDeviceID"))
+    platform_version = str(device.get("ProductVersion"))
+    mount_developer_image(udid)
+    tunnel_info = ensure_remote_xpc(udid)
+    runner_state = start_wda_runner(tunnel_info, args.wda_bundle_id)
+    start_server()
+    wda_address = str(runner_state["address"])
+    wda_host = f"[{wda_address}]" if ":" in wda_address else wda_address
+    wda_url = f"http://{wda_host}:8100"
+    capabilities: dict[str, Any] = {
+        "platformName": "iOS",
+        "appium:automationName": "XCUITest",
+        "appium:udid": udid,
+        "appium:platformVersion": platform_version,
+        "appium:webDriverAgentUrl": wda_url,
+        "appium:noReset": True,
+        "appium:newCommandTimeout": 3600,
+        "appium:wdaLaunchTimeout": 90000,
+        "appium:wdaConnectionTimeout": 90000,
+    }
+    if args.bundle_id:
+        capabilities["appium:bundleId"] = args.bundle_id
+    response = http_json(
+        "POST",
+        "/session",
+        {"capabilities": {"alwaysMatch": capabilities, "firstMatch": [{}]}},
+        timeout=180.0,
+    )
+    value = response.get("value")
+    sid = response.get("sessionId")
+    if not sid and isinstance(value, dict):
+        sid = value.get("sessionId")
+    if not sid:
+        raise BridgeError(f"Appium did not return a session id: {response}")
+    state = {
+        "session_id": sid,
+        "udid": udid,
+        "platform_version": platform_version,
+        "wda_bundle_id": args.wda_bundle_id,
+        "wda_url": wda_url,
+        "app_bundle_id": args.bundle_id,
+        "started": time.time(),
+    }
+    write_json_file(SESSION_FILE, state)
+    print(json.dumps(state, ensure_ascii=False, indent=2))
+
+
+def stop_session() -> None:
+    state = session_state(required=False)
+    if not state:
+        print("iOS session is not running")
+        return
+    sid = state.get("session_id")
+    try:
+        if sid and appium_ready():
+            http_json("DELETE", f"/session/{sid}", timeout=30.0)
+    finally:
+        SESSION_FILE.unlink(missing_ok=True)
+    print("iOS session stopped")
+
+
+def response_value(data: dict[str, Any]) -> Any:
+    return data.get("value", data)
+
+
+def window_size() -> tuple[int, int]:
+    data = session_request("GET", "/window/rect")
+    value = response_value(data)
+    if not isinstance(value, dict):
+        raise BridgeError(f"unexpected window response: {data}")
+    width = value.get("width")
+    height = value.get("height")
+    if width is None or height is None:
+        raise BridgeError(f"window response lacks dimensions: {data}")
+    return int(width), int(height)
+
+
+def capture_session_screenshot(output: Path) -> Path:
+    data = session_request("GET", "/screenshot", timeout=30.0)
+    encoded = response_value(data)
+    if not isinstance(encoded, str):
+        raise BridgeError("Appium did not return a base64 screenshot")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_bytes(base64.b64decode(encoded))
+    return output
+
+
+def capture_any_screenshot(output: Path, requested_udid: str | None = None) -> Path:
+    if session_is_alive(session_state(required=False)):
+        return capture_session_screenshot(output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    address, rsd_port, _ = hid_rsd(requested_udid)
+    pmd3(
+        "developer",
+        "core-device",
+        "screen-capture",
+        "screenshot",
+        str(output),
+        "--rsd",
+        address,
+        str(rsd_port),
+    )
+    return output
+
+
+def png_size(path: Path) -> tuple[int, int]:
+    header = path.read_bytes()[:24]
+    if len(header) != 24 or header[:8] != b"\x89PNG\r\n\x1a\n" or header[12:16] != b"IHDR":
+        raise BridgeError(f"not a PNG file: {path}")
+    return struct.unpack(">II", header[16:24])
+
+
+def image_to_logical(path: Path, x: float, y: float) -> tuple[int, int, dict[str, Any]]:
+    image_width, image_height = png_size(path)
+    logical_width, logical_height = window_size()
+    if x < 0 or y < 0 or x > image_width or y > image_height:
+        raise BridgeError(f"image coordinate ({x}, {y}) is outside {image_width}x{image_height}")
+    logical_x = round(x * logical_width / image_width)
+    logical_y = round(y * logical_height / image_height)
+    details = {
+        "image": str(path),
+        "image_size": {"width": image_width, "height": image_height},
+        "logical_size": {"width": logical_width, "height": logical_height},
+    }
+    return logical_x, logical_y, details
+
+
+def image_to_hid(path: Path, x: float, y: float) -> tuple[int, int, dict[str, Any]]:
+    image_width, image_height = png_size(path)
+    if x < 0 or y < 0 or x > image_width or y > image_height:
+        raise BridgeError(f"image coordinate ({x}, {y}) is outside {image_width}x{image_height}")
+    hid_x = round(x * 65535 / image_width)
+    hid_y = round(y * 65535 / image_height)
+    details = {
+        "image": str(path),
+        "image_size": {"width": image_width, "height": image_height},
+        "hid_range": {"width": 65535, "height": 65535},
+    }
+    return hid_x, hid_y, details
+
+
+def hid_tap(requested_udid: str | None, x: int, y: int) -> None:
+    address, rsd_port, _ = hid_rsd(requested_udid)
+    pmd3(
+        "developer",
+        "core-device",
+        "universal-hid-service",
+        "tap",
+        str(x),
+        str(y),
+        "--rsd",
+        address,
+        str(rsd_port),
+    )
+
+
+def hid_drag(
+    requested_udid: str | None,
+    x1: int,
+    y1: int,
+    x2: int,
+    y2: int,
+    duration_ms: int,
+) -> None:
+    address, rsd_port, _ = hid_rsd(requested_udid)
+    pmd3(
+        "developer",
+        "core-device",
+        "universal-hid-service",
+        "drag",
+        str(x1),
+        str(y1),
+        str(x2),
+        str(y2),
+        "--duration",
+        str(duration_ms / 1000),
+        "--rsd",
+        address,
+        str(rsd_port),
+    )
+
+
+def tap(x: int, y: int) -> None:
+    payload = {
+        "actions": [
+            {
+                "type": "pointer",
+                "id": "finger1",
+                "parameters": {"pointerType": "touch"},
+                "actions": [
+                    {"type": "pointerMove", "duration": 0, "origin": "viewport", "x": x, "y": y},
+                    {"type": "pointerDown", "button": 0},
+                    {"type": "pause", "duration": 70},
+                    {"type": "pointerUp", "button": 0},
+                ],
+            }
+        ]
+    }
+    session_request("POST", "/actions", payload)
+
+
+def swipe(x1: int, y1: int, x2: int, y2: int, duration_ms: int) -> None:
+    payload = {
+        "actions": [
+            {
+                "type": "pointer",
+                "id": "finger1",
+                "parameters": {"pointerType": "touch"},
+                "actions": [
+                    {"type": "pointerMove", "duration": 0, "origin": "viewport", "x": x1, "y": y1},
+                    {"type": "pointerDown", "button": 0},
+                    {
+                        "type": "pointerMove",
+                        "duration": duration_ms,
+                        "origin": "viewport",
+                        "x": x2,
+                        "y": y2,
+                    },
+                    {"type": "pointerUp", "button": 0},
+                ],
+            }
+        ]
+    }
+    session_request("POST", "/actions", payload)
+
+
+def fresh_before_image(requested_udid: str | None = None) -> Path:
+    ensure_state_dir()
+    return capture_any_screenshot(STATE_DIR / "latest-before.png", requested_udid)
+
+
+def fresh_after_image(requested_udid: str | None = None) -> Path:
+    time.sleep(0.25)
+    return capture_any_screenshot(STATE_DIR / "latest-after.png", requested_udid)
+
+
+def cmd_doctor(args: argparse.Namespace) -> None:
+    checks: dict[str, Any] = {
+        "pymobiledevice3": PMD3.is_file(),
+        "wda_ipa": DEFAULT_WDA_IPA.is_file(),
+        "appium_ready": appium_ready(),
+        "session_active": session_is_alive(session_state(required=False)),
+    }
+    try:
+        checks["wda_python"] = str(wda_python())
+    except BridgeError as exc:
+        checks["wda_python_error"] = str(exc)
+    try:
+        node_dir, appium_bin = appium_paths()
+        checks["node"] = str(node_dir)
+        checks["appium"] = str(appium_bin)
+    except BridgeError as exc:
+        checks["appium_error"] = str(exc)
+    try:
+        checks["devices"] = usb_devices()
+    except BridgeError as exc:
+        checks["device_error"] = str(exc)
+    tunnel = active_tunnel_registry()
+    checks["remotexpc"] = (
+        {
+            "ready": True,
+            "registry_port": tunnel[0],
+            "udids": sorted((tunnel[1].get("tunnels") or {}).keys()),
+        }
+        if tunnel
+        else {"ready": False, "registry_port": read_tunnel_registry_port()}
+    )
+    print(json.dumps(checks, ensure_ascii=False, indent=2))
+
+
+def cmd_devices(args: argparse.Namespace) -> None:
+    print(json.dumps(usb_devices(), ensure_ascii=False, indent=2))
+
+
+def cmd_info(args: argparse.Namespace) -> None:
+    print(json.dumps(select_device(args.udid), ensure_ascii=False, indent=2))
+
+
+def cmd_pair(args: argparse.Namespace) -> None:
+    pmd3("lockdown", "pair", "--udid", device_udid(args.udid))
+
+
+def cmd_wireless_on(args: argparse.Namespace) -> None:
+    udid = device_udid(args.udid)
+    pmd3("lockdown", "wifi-connections", "--state", "on", "--udid", udid)
+    pmd3("lockdown", "remotepairing", "--pair", "--udid", udid)
+    print("Wi-Fi connections and RemotePairing are enabled. Keep both devices on the same LAN.")
+
+
+def cmd_wireless_browse(args: argparse.Namespace) -> None:
+    pmd3("remote", "browse")
+
+
+def cmd_tunnel_status(args: argparse.Namespace) -> None:
+    active = active_tunnel_registry()
+    if active is None:
+        print(json.dumps({"ready": False, "registry_port": read_tunnel_registry_port()}, indent=2))
+        return
+    port, data = active
+    tunnels = data.get("tunnels") or {}
+    summary = {
+        udid: {
+            "address": item.get("address"),
+            "rsd_port": item.get("rsdPort"),
+            "service_count": len(item.get("services") or {}),
+        }
+        for udid, item in tunnels.items()
+        if isinstance(item, dict)
+    }
+    print(json.dumps({"ready": True, "registry_port": port, "tunnels": summary}, indent=2))
+
+
+def cmd_tunnel_start(args: argparse.Namespace) -> None:
+    active = active_tunnel_registry()
+    if active is not None:
+        print(f"RemoteXPC tunnel registry is already running on port {active[0]}")
+        return
+    udid = device_udid(args.udid)
+    port = args.registry_port
+    write_tunnel_registry_port(port)
+    node_bin_dir, appium_bin = appium_paths()
+    ensure_state_dir()
+    command = [
+        "pkexec",
+        "env",
+        f"PATH={node_bin_dir}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        f"APPIUM_HOME={SHARE_DIR / 'appium-home'}",
+        str(appium_bin),
+        "driver",
+        "run",
+        "xcuitest",
+        "tunnel-creation",
+        "--udid",
+        udid,
+        "--tunnel-registry-port",
+        str(port),
+        "--disconnect-retry-max-attempts",
+        "0",
+    ]
+    print(
+        f"Starting the privileged RemoteXPC tunnel for {udid} on port {port}; keep this command running.",
+        flush=True,
+    )
+    os.execvp(command[0], command)
+
+
+def cmd_mount(args: argparse.Namespace) -> None:
+    mount_developer_image(device_udid(args.udid))
+
+
+def cmd_install_wda(args: argparse.Namespace) -> None:
+    ipa = Path(args.ipa).resolve()
+    if not ipa.is_file():
+        raise BridgeError(f"WDA package does not exist: {ipa}")
+    pmd3("apps", "install", "--developer", str(ipa), "--udid", device_udid(args.udid))
+
+
+def cmd_apps(args: argparse.Namespace) -> None:
+    pmd3("apps", "list", "--type", args.type, "--udid", device_udid(args.udid))
+
+
+def cmd_start(args: argparse.Namespace) -> None:
+    start_session(args)
+
+
+def cmd_stop(args: argparse.Namespace) -> None:
+    stop_session()
+    if wda_runner_alive():
+        stop_wda_runner()
+
+
+def cmd_server_stop(args: argparse.Namespace) -> None:
+    if session_state(required=False):
+        stop_session()
+    if wda_runner_alive():
+        stop_wda_runner()
+    stop_server()
+
+
+def cmd_wda_start(args: argparse.Namespace) -> None:
+    udid = device_udid(args.udid)
+    tunnel_info = ensure_remote_xpc(udid)
+    state = start_wda_runner(tunnel_info, args.wda_bundle_id)
+    print(json.dumps(state, ensure_ascii=False, indent=2))
+
+
+def cmd_wda_stop(args: argparse.Namespace) -> None:
+    if session_state(required=False):
+        stop_session()
+    stop_wda_runner()
+
+
+def cmd_wda_status(args: argparse.Namespace) -> None:
+    state = read_json_file(WDA_RUNNER_FILE)
+    ready = False
+    if state and wda_runner_alive(state):
+        ready = wda_status_via_rsd(str(state.get("address")), int(state.get("rsd_port") or 0))
+    print(json.dumps({"ready": ready, "process_alive": wda_runner_alive(state), "runner": state}, indent=2))
+
+
+def cmd_status(args: argparse.Namespace) -> None:
+    state = session_state(required=False)
+    active = session_is_alive(state)
+    result = {
+        "server_ready": appium_ready(),
+        "session_active": active,
+        "session": state,
+        "control_backend": (
+            "appium-wda"
+            if active
+            else "coredevice-hid"
+            if coredevice_touch_supported(args.udid)
+            else "coredevice-screenshot; appium-wda-on-demand-for-input"
+        ),
+        "automation_indicator_expected": active,
+        "log": str(APPIUM_LOG),
+    }
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+def cmd_screenshot(args: argparse.Namespace) -> None:
+    output = Path(args.output).resolve()
+    capture_any_screenshot(output, args.udid)
+    width, height = png_size(output)
+    print(json.dumps({"path": str(output), "width": width, "height": height}, indent=2))
+
+
+def cmd_source(args: argparse.Namespace) -> None:
+    ensure_wda_session(args.udid)
+    value = response_value(session_request("GET", "/source", timeout=30.0))
+    if not isinstance(value, str):
+        raise BridgeError("Appium did not return an XML source string")
+    if args.output:
+        output = Path(args.output).resolve()
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(value, encoding="utf-8")
+        print(str(output))
+    else:
+        print(value)
+
+
+def cmd_window_size(args: argparse.Namespace) -> None:
+    ensure_wda_session(args.udid)
+    width, height = window_size()
+    print(json.dumps({"width": width, "height": height}, indent=2))
+
+
+def cmd_tap(args: argparse.Namespace) -> None:
+    ensure_wda_session(args.udid)
+    tap(args.x, args.y)
+
+
+def cmd_tap_image(args: argparse.Namespace) -> None:
+    image = Path(args.image).resolve() if args.image else fresh_before_image(args.udid)
+    if not session_is_alive(session_state(required=False)) and not coredevice_touch_supported(args.udid):
+        ensure_wda_session(args.udid)
+    if session_is_alive(session_state(required=False)):
+        action_x, action_y, details = image_to_logical(image, args.x, args.y)
+        tap(action_x, action_y)
+        details["backend"] = "appium-wda"
+        details["logical_point"] = {"x": action_x, "y": action_y}
+    else:
+        action_x, action_y, details = image_to_hid(image, args.x, args.y)
+        hid_tap(args.udid, action_x, action_y)
+        details["backend"] = "coredevice-hid"
+        details["hid_point"] = {"x": action_x, "y": action_y}
+    after = fresh_after_image(args.udid)
+    details.update(
+        {
+            "image_point": {"x": args.x, "y": args.y},
+            "after": str(after),
+        }
+    )
+    print(json.dumps(details, ensure_ascii=False, indent=2))
+
+
+def cmd_swipe(args: argparse.Namespace) -> None:
+    ensure_wda_session(args.udid)
+    swipe(args.x1, args.y1, args.x2, args.y2, args.duration_ms)
+
+
+def cmd_swipe_image(args: argparse.Namespace) -> None:
+    image = Path(args.image).resolve() if args.image else fresh_before_image(args.udid)
+    if not session_is_alive(session_state(required=False)) and not coredevice_touch_supported(args.udid):
+        ensure_wda_session(args.udid)
+    if session_is_alive(session_state(required=False)):
+        x1, y1, details = image_to_logical(image, args.x1, args.y1)
+        x2, y2, _ = image_to_logical(image, args.x2, args.y2)
+        swipe(x1, y1, x2, y2, args.duration_ms)
+        details["backend"] = "appium-wda"
+        details["logical_start"] = {"x": x1, "y": y1}
+        details["logical_end"] = {"x": x2, "y": y2}
+    else:
+        x1, y1, details = image_to_hid(image, args.x1, args.y1)
+        x2, y2, _ = image_to_hid(image, args.x2, args.y2)
+        hid_drag(args.udid, x1, y1, x2, y2, args.duration_ms)
+        details["backend"] = "coredevice-hid"
+        details["hid_start"] = {"x": x1, "y": y1}
+        details["hid_end"] = {"x": x2, "y": y2}
+    after = fresh_after_image(args.udid)
+    details.update(
+        {
+            "image_start": {"x": args.x1, "y": args.y1},
+            "image_end": {"x": args.x2, "y": args.y2},
+            "duration_ms": args.duration_ms,
+            "after": str(after),
+        }
+    )
+    print(json.dumps(details, ensure_ascii=False, indent=2))
+
+
+def cmd_type(args: argparse.Namespace) -> None:
+    if not session_is_alive(session_state(required=False)) and coredevice_touch_supported(args.udid):
+        address, rsd_port, _ = hid_rsd(args.udid)
+        pmd3(
+            "developer",
+            "core-device",
+            "universal-hid-service",
+            "type",
+            args.text,
+            "--rsd",
+            address,
+            str(rsd_port),
+        )
+        return
+    ensure_wda_session(args.udid)
+    payload = {"value": list(args.text)}
+    try:
+        session_request("POST", "/wda/keys", payload)
+    except BridgeError:
+        session_request("POST", "/keys", payload)
+
+
+def cmd_tap_element(args: argparse.Namespace) -> None:
+    ensure_wda_session(args.udid)
+    found = response_value(session_request("POST", "/element", {"using": args.using, "value": args.selector}))
+    if not isinstance(found, dict):
+        raise BridgeError(f"element was not found: {args.selector}")
+    element_id = found.get("element-6066-11e4-a52e-4f735466cecf") or found.get("ELEMENT") or found.get("element")
+    if not element_id:
+        raise BridgeError(f"element response has no id: {found}")
+    session_request("POST", f"/element/{element_id}/click", {})
+    print(str(element_id))
+
+
+def cmd_press(args: argparse.Namespace) -> None:
+    if not session_is_alive(session_state(required=False)):
+        address, rsd_port, _ = hid_rsd(args.udid)
+        name = {"volumeUp": "volume-up", "volumeDown": "volume-down"}.get(args.name, args.name)
+        pmd3(
+            "developer",
+            "core-device",
+            "hid",
+            "button",
+            name,
+            "--rsd",
+            address,
+            str(rsd_port),
+        )
+        return
+    session_request(
+        "POST",
+        "/execute/sync",
+        {"script": "mobile: pressButton", "args": [{"name": args.name}]},
+    )
+
+
+def cmd_activate(args: argparse.Namespace) -> None:
+    ensure_wda_session(args.udid)
+    session_request("POST", "/appium/device/activate_app", {"bundleId": args.bundle_id})
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="ios-cuctl",
+        description="Inspect and operate a user-authorized physical iOS device from Linux.",
+    )
+    parser.add_argument("--udid", help="Select a specific trusted USB device by UDID")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    def add(name: str, help_text: str, handler: Any) -> argparse.ArgumentParser:
+        item = sub.add_parser(name, help=help_text)
+        item.set_defaults(handler=handler)
+        return item
+
+    add("doctor", "Check tools, device discovery, server, and session", cmd_doctor)
+    add("devices", "List trusted USB iOS devices", cmd_devices)
+    add("info", "Show the selected device's basic information", cmd_info)
+    add("pair", "Pair the selected unlocked device over USB", cmd_pair)
+    add("wireless-on", "Enable Wi-Fi connections and bootstrap RemotePairing", cmd_wireless_on)
+    add("wireless-browse", "Browse RemoteXPC devices advertised on the LAN", cmd_wireless_browse)
+    tunnel_start = add(
+        "tunnel-start",
+        "Start the privileged RemoteXPC tunnel in the foreground",
+        cmd_tunnel_start,
+    )
+    tunnel_start.add_argument("--registry-port", type=int, default=DEFAULT_TUNNEL_REGISTRY_PORT)
+    add("tunnel-status", "Show the active RemoteXPC registry and device tunnels", cmd_tunnel_status)
+    add("mount", "Mount the matching personalized DeveloperDiskImage", cmd_mount)
+
+    install = add("install-wda", "Install the signed prebuilt WDA package", cmd_install_wda)
+    install.add_argument("--ipa", default=str(DEFAULT_WDA_IPA), help="Signed WDA .ipa path")
+
+    apps = add("apps", "List installed apps", cmd_apps)
+    apps.add_argument("--type", choices=["System", "User", "Hidden", "Any"], default="User")
+
+    start = add("start", "Start or reuse one persistent Appium/WDA session", cmd_start)
+    start.add_argument("--bundle-id", help="App bundle identifier to activate in the new session")
+    start.add_argument("--wda-bundle-id", default=DEFAULT_WDA_BUNDLE_ID)
+
+    add("stop", "Stop Appium attachment and WDA, removing the automation indicator", cmd_stop)
+    wda_start = add("wda-start", "Start or reuse the persistent XCTest-managed WDA", cmd_wda_start)
+    wda_start.add_argument("--wda-bundle-id", default=DEFAULT_WDA_BUNDLE_ID)
+    add("wda-status", "Show the persistent XCTest WDA runner status", cmd_wda_status)
+    add("wda-stop", "Stop the Appium session and persistent XCTest WDA runner", cmd_wda_stop)
+    add("server-stop", "Stop the session and bridge-owned Appium server", cmd_server_stop)
+    add("status", "Show Appium and WDA session status", cmd_status)
+
+    screenshot = add("screenshot", "Save a PNG screenshot", cmd_screenshot)
+    screenshot.add_argument("output")
+
+    source = add("source", "Print or save the current accessibility hierarchy", cmd_source)
+    source.add_argument("--output")
+    add("window-size", "Show WDA logical-point dimensions", cmd_window_size)
+
+    tap_cmd = add("tap", "Tap WDA logical coordinates", cmd_tap)
+    tap_cmd.add_argument("x", type=int)
+    tap_cmd.add_argument("y", type=int)
+
+    tap_image = add("tap-image", "Convert screenshot pixels and tap via WDA or CoreDevice HID", cmd_tap_image)
+    tap_image.add_argument("x", type=float)
+    tap_image.add_argument("y", type=float)
+    tap_image.add_argument("--image", help="Screenshot used for coordinates; omit to capture a fresh one")
+
+    swipe_cmd = add("swipe", "Swipe between WDA logical coordinates", cmd_swipe)
+    for name in ("x1", "y1", "x2", "y2"):
+        swipe_cmd.add_argument(name, type=int)
+    swipe_cmd.add_argument("--duration-ms", type=int, default=250)
+
+    swipe_image = add("swipe-image", "Convert screenshot pixels and drag via WDA or CoreDevice HID", cmd_swipe_image)
+    for name in ("x1", "y1", "x2", "y2"):
+        swipe_image.add_argument(name, type=float)
+    swipe_image.add_argument("--image", help="Screenshot used for coordinates; omit to capture a fresh one")
+    swipe_image.add_argument("--duration-ms", type=int, default=250)
+
+    type_cmd = add("type", "Type text into the focused element", cmd_type)
+    type_cmd.add_argument("text")
+
+    tap_element = add("tap-element", "Find an element and tap it", cmd_tap_element)
+    tap_element.add_argument("selector")
+    tap_element.add_argument(
+        "--using",
+        default="accessibility id",
+        choices=["accessibility id", "name", "class name", "xpath", "-ios predicate string", "-ios class chain"],
+    )
+
+    press = add("press", "Press an iOS hardware button through WDA", cmd_press)
+    press.add_argument("name", choices=["home", "volumeUp", "volumeDown", "lock"])
+
+    activate = add("activate", "Activate an installed app by bundle identifier", cmd_activate)
+    activate.add_argument("bundle_id")
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    try:
+        args.handler(args)
+    except BridgeError as exc:
+        die(str(exc))
+    except KeyboardInterrupt:
+        die("interrupted", 130)
+
+
+if __name__ == "__main__":
+    main()
