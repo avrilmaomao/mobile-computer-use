@@ -24,22 +24,24 @@ The bridge is portable and reads these optional environment variables:
 
 The bridge also detects the tested portable Node/Appium layout under `$IOS_CUCTL_SHARE_DIR/tools/`. Keep machine-specific values in the shell environment or the user-only config file; never commit them with signing assets. The config parser accepts plain `IOS_CUCTL_NAME=value` assignments but does not execute shell code.
 
-## Start every task
+## Start a routine task
 
-Run:
+When the phone has already been paired and the persistent tunnel service is installed, begin with:
 
 ```bash
-"$HOME/ios-computer-use/ios-cuctl" doctor
-"$HOME/ios-computer-use/ios-cuctl" devices
+"$HOME/ios-computer-use/ios-cuctl" tunnel-status
+"$HOME/ios-computer-use/ios-cuctl" status
 ```
 
-If more than one trusted USB device is present, pass `--udid` before the subcommand. Never guess which device the user intended.
+If `tunnel-status` reports `ready: true` with exactly one tunnel, reuse it. `registry_ready: true` with `ready: false` means the background service is healthy but no phone tunnel is currently active; keep the phone awake with Wi-Fi enabled and confirm it is on the same LAN. Use `wireless-browse` only when the registry has no active phone; its output is deduplicated by device and endpoint. Run `doctor` and `devices` for first-time setup, USB work, or troubleshooting rather than before every routine action.
+
+If more than one tunneled or trusted USB device is present, pass `--udid` before the subcommand. Never guess which device the user intended.
 
 For the simplest no-banner path, keep the RemoteXPC tunnel running and use `screenshot`, `activate`, or hardware `press`. CoreDevice screen capture and app launch do not start XCTest, so iOS does not show the "Automation Running" indicator.
 
-CoreDevice touch/keyboard remote control requires iOS 27 or later. On iOS 26 and earlier, `tap-image`, `swipe-image`, `type`, element commands, and logical-coordinate commands automatically start Appium/WDA on demand. Hardware `press` uses CoreDevice Indigo HID without WDA on all supported versions. While WDA is active, iOS shows its system-level automation indicator until `stop` or `wda-stop` is run. This version gate was verified against the device-side CoreDevice error 9021 on iOS 26.6.
+CoreDevice touch/keyboard remote control requires iOS 27 or later. On iOS 26 and earlier, `tap-image`, `swipe-image`, `type`, element commands, and logical-coordinate commands automatically start Appium/WDA on demand. USB plus WDA is the most reliable input path on those versions unless a WDA v13+ artifact compatible with persistent preinstalled launch has been prepared. Hardware `press` uses CoreDevice Indigo HID without WDA on all supported versions. While WDA is active, iOS shows its system-level automation indicator until `stop` or `wda-stop` is run. This version gate was verified against the device-side CoreDevice error 9021 on iOS 26.6.
 
-Start the local Appium/WDA session only when accessibility hierarchy or element-based interaction is needed:
+Start the local Appium/WDA session only when accessibility hierarchy or element-based interaction is needed. Run `tunnel-start` only when `registry_ready` is false and no persistent system service is installed:
 
 ```bash
 "$HOME/ios-computer-use/ios-cuctl" tunnel-status
@@ -60,7 +62,7 @@ Do not restart Appium or WDA between ordinary screenshots, taps, swipes, text en
 For UI actions:
 
 1. Capture a fresh screenshot.
-2. Inspect it with the available image-viewing tool.
+2. Inspect it with the available image-viewing tool. A fully black capture can mean the display is asleep; issue the reversible `press home` action and capture again. If a lock screen is then visible, ask the user to unlock it.
 3. Use `tap-image` or `swipe-image`; these automatically choose CoreDevice HID on iOS 27+ or start WDA on older versions, convert coordinates, and save an after-action screenshot.
 4. Prefer `source` plus `tap-element` when stable accessibility identifiers or hierarchy inspection are needed; these start WDA on demand.
 5. Inspect the after-action screenshot and report the observed result, not just command success.
@@ -119,9 +121,9 @@ systemctl status "ios-computer-use-tunneld@$(id -un).service" --no-pager
 "$HOME/ios-computer-use/ios-cuctl" tunnel-status
 ```
 
-The service invokes the bundled `ios-tunneld-runner` directly because pymobiledevice3's public CLI requires UID 0 even when systemd has already supplied the required capability. The runner exposes both pymobiledevice3's native registry and Appium's `/remotexpc/tunnels` API, including the RSD service catalog Appium needs for its non-macOS preinstalled-WDA strategy. It also probes active RSD endpoints and rebuilds stale tunnels in place, so normal phone disconnect/reconnect recovery does not require another sudo or polkit prompt. The bridge normalizes either registry format, checks the persistent registry before its older per-session registry, prefers a registry containing an active device tunnel, and treats that registry as a device source when USB is disconnected. On a persistent tunnel, WDA is launched by Appium with `usePreinstalledWDA`; do not substitute pymobiledevice3's generic XCTest launcher, because iOS may reject the runner's device-to-host callback with NECP. The installed runner must be a WDA v13+ build prepared for preinstalled launch. If Appium launches a black WDA runner but port 8100 never opens, replace the signed WDA artifact; more host privilege does not fix that package mismatch. Granting `CAP_NET_ADMIN` lets this service manage host TUN interfaces and routes; it is narrower than root but remains a host networking privilege. If the user home is not `/home/<user>` or pymobiledevice3 uses a different Python path, copy the template and adjust `Environment`, `ExecStart`, `ReadWritePaths`, and `ReadOnlyPaths` before installing it.
+The service invokes the bundled `ios-tunneld-runner` directly because pymobiledevice3's public CLI requires UID 0 even when systemd has already supplied the required capability. The runner exposes both pymobiledevice3's native registry and Appium's `/remotexpc/tunnels` API, including the RSD service catalog Appium needs for its non-macOS preinstalled-WDA strategy. It also probes active RSD endpoints and rebuilds stale tunnels in place, so normal phone disconnect/reconnect recovery does not require another sudo or polkit prompt. The first command after a reconnect can take roughly 30 seconds while one automatic rebuild/retry completes; keep the device awake for the quickest recovery rather than starting another tunnel. The bridge normalizes either registry format, checks the persistent registry before its older per-session registry, prefers a registry containing an active device tunnel, and treats that registry as a device source when USB is disconnected. On a persistent tunnel, WDA is launched by Appium with `usePreinstalledWDA`; do not substitute pymobiledevice3's generic XCTest launcher, because iOS may reject the runner's device-to-host callback with NECP. The installed runner must be a WDA v13+ build prepared for preinstalled launch. If Appium launches a black WDA runner but port 8100 never opens, replace the signed WDA artifact; more host privilege does not fix that package mismatch. Granting `CAP_NET_ADMIN` lets this service manage host TUN interfaces and routes; it is narrower than root but remains a host networking privilege. If the user home is not `/home/<user>` or pymobiledevice3 uses a different Python path, copy the template and adjust `Environment`, `ExecStart`, `ReadWritePaths`, and `ReadOnlyPaths` before installing it.
 
-CoreDevice screenshots and hardware `press` can operate while the display is locked. WDA/Appium accessibility, touch, and text input require the device to be unlocked; if the phone locks during wireless WDA startup, iOS may terminate the XCTest connection. Never attempt to bypass the lock screen—ask the user to unlock and retry.
+CoreDevice screenshots and hardware `press` can operate while the display is locked, but a sleeping display can initially produce a black capture. Use `press home`, capture again, and ask the user to unlock before app interaction or input. WDA/Appium accessibility, touch, and text input require the device to be unlocked; if the phone locks during wireless WDA startup, iOS may terminate the XCTest connection. Never attempt to bypass the lock screen—ask the user to unlock and retry.
 
 For a tunnel started outside the bridge, set `IOS_CUCTL_RSD_ADDRESS`, `IOS_CUCTL_RSD_PORT`, `IOS_CUCTL_WIFI_UDID`, and optionally `IOS_CUCTL_WIFI_PLATFORM_VERSION`. Use `IOS_CUCTL_TRANSPORT=usb` to force the original USB tunnel while a Wi-Fi tunnel is running.
 
@@ -145,9 +147,10 @@ Keep signing materials outside the repository, preferably under `$HOME/.local/sh
 Common failures:
 
 - `DeviceLocked`: ask the user to unlock the device and keep the screen on, then retry `mount` or `start`. Never attempt to discover or enter a passcode.
-- RemoteXPC registry missing: run `tunnel-status`; if it is not ready, run `tunnel-start`, approve the privilege prompt, and keep that process running. `start` automatically repairs the root/user Strongbox port split when the registry is reachable.
+- RemoteXPC registry missing: run `tunnel-status`; only when `registry_ready` is false and no persistent system service is installed, run `tunnel-start`, approve the privilege prompt, and keep that process running. `start` automatically repairs the root/user Strongbox port split when the registry is reachable.
 - Preinstalled WDA never opens port 8100: confirm WDA v13+, remove embedded `Frameworks/XC*` copies, and install a device-signed runner built for the preinstalled launch flow. On iOS 26 and earlier, CoreDevice touch is not a fallback; it requires iOS 27+.
-- No device: verify USB enumeration and `usbmuxd`, then ask the user to reconnect and approve Trust if needed.
+- No active wireless tunnel: if `registry_ready` is true but `ready` is false, keep the phone awake, enable Wi-Fi, confirm host and phone are on the same LAN, and run `wireless-browse`; do not start a duplicate tunnel service.
+- No USB device: verify USB enumeration and `usbmuxd`, then ask the user to reconnect and approve Trust if needed.
 - Developer image missing: run `mount` while unlocked; iOS 17+ uses a personalized DeveloperDiskImage.
 - WDA missing or untrusted: confirm explicit authorization, reinstall with `install-wda`, and ask the user to accept any on-device developer trust prompt.
 - Stale session: run `stop`, then `start`. Use `server-stop` only when the local Appium server itself must be restarted.

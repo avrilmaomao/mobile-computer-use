@@ -9,16 +9,18 @@ Use the installed implementation at `${HOME}/ios-computer-use`. Do not copy or r
 
 Before the first iOS-device action in every task, read `${HOME}/ios-computer-use/AGENTS.md` completely. It is the authoritative guide for setup, safety, persistent WDA sessions, coordinate conversion, screenshots, and verification.
 
-Start with:
+For an already configured wireless device, start with the lightweight persistent-service probe:
 
 ```bash
-"$HOME/ios-computer-use/ios-cuctl" doctor
-"$HOME/ios-computer-use/ios-cuctl" devices
+"$HOME/ios-computer-use/ios-cuctl" tunnel-status
+"$HOME/ios-computer-use/ios-cuctl" status
 ```
+
+If `tunnel-status` reports `ready: true` with exactly one tunnel, reuse it. Do not run raw discovery, start another tunnel, or start WDA for screenshots, app listing/activation, or hardware buttons. Use `doctor` and `devices` for first-time setup, USB work, or troubleshooting.
 
 Use `"$HOME/ios-computer-use/ios-cuctl" --help` for the supported command surface. Prefer this constrained bridge over raw `pymobiledevice3`, Appium HTTP calls, or hand-calculated Retina coordinate conversion.
 
-Start or reuse one persistent session before repeated UI actions. For coordinate-based actions, take a fresh screenshot, inspect it with the available image-viewing tool, call `tap-image` or `swipe-image`, then inspect the automatically saved after-action screenshot. Use `source` and `tap-element` when stable accessibility data is available.
+Take a fresh screenshot before input. If it is black, use the reversible `press home` action and capture again; if a lock screen is visible, ask the user to unlock. On iOS 27+, `tap-image`, `swipe-image`, and typing can use CoreDevice directly. On iOS 26 and earlier, touch, text, source, and element commands require Appium/WDA; prefer USB plus WDA unless the persistent tunnel has a compatible preinstalled WDA build. After WDA is available, reuse one session for repeated UI actions. Use `source` and `tap-element` when stable accessibility data is available.
 
 For fully wireless operation, prefer the optional persistent system tunneld described in `AGENTS.md`; it needs one administrator-approved installation and avoids repeated authorization dialogs. Otherwise run `"$HOME/ios-computer-use/ios-cuctl" wifi-tunnel-start` in a persistent terminal after initial USB pairing. Once a tunnel reports ready, ordinary bridge commands automatically prefer the Wi-Fi RSD connection. Verify with `tunnel-status` and an actual screenshot or reversible hardware-button action.
 

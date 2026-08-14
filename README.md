@@ -45,7 +45,7 @@ For Claude Code discovery and verification, read [docs/CLAUDE_CODE.md](docs/CLAU
 
 Android requires `adb`; `scrcpy` is required only for live mirroring. The controller can use system commands from `PATH` or an official portable runtime placed under `~/android-computer-use/runtime/`.
 
-iOS requires Python 3, `pymobiledevice3`, Node.js, Appium with the XCUITest driver, a trusted physical device, and a WebDriverAgent IPA signed for that device. iOS signing assets are intentionally not included. Configure the signed IPA and runner bundle ID with `IOS_CUCTL_WDA_IPA` and `IOS_CUCTL_WDA_BUNDLE_ID`, either in the environment or in the non-executable `$HOME/.config/ios-computer-use/env` file. After initial USB pairing, `wifi-tunnel-start` provides a persistent Wi-Fi RemoteXPC path that ordinary bridge commands reuse automatically.
+iOS requires Python 3, `pymobiledevice3`, Node.js, Appium with the XCUITest driver, a trusted physical device, and a WebDriverAgent IPA signed for that device. iOS signing assets are intentionally not included. Configure the signed IPA and runner bundle ID with `IOS_CUCTL_WDA_IPA` and `IOS_CUCTL_WDA_BUNDLE_ID`, either in the environment or in the non-executable `$HOME/.config/ios-computer-use/env` file. After initial USB pairing, either the optional system service or a foreground `wifi-tunnel-start` provides a Wi-Fi RemoteXPC path that ordinary bridge commands reuse automatically.
 
 On a dedicated Linux host, the bundled `ios-computer-use-tunneld@.service` can be installed once as a constrained system service. It runs as the selected user with only `CAP_NET_ADMIN`, starts at boot, and avoids a new sudo/polkit dialog for each wireless session. See the iOS operations guide for the one-time installation commands.
 
@@ -58,6 +58,17 @@ Run the read-only checks after installation:
 "$HOME/ios-computer-use/ios-cuctl" doctor
 "$HOME/ios-computer-use/ios-cuctl" devices
 ```
+
+## Daily fast path
+
+Setup and troubleshooting use `doctor`; routine operation should probe the smallest stable state first:
+
+| Platform | Routine probe | Reuse rule | Main wireless capabilities |
+|---|---|---|---|
+| Android | `android-cuctl devices` | If exactly one `HOST:PORT` target is already `device`, use it directly; mDNS discovery is unnecessary. | Screenshot, UI dump, tap, swipe, ASCII text, key events, app launch, and scrcpy. |
+| iOS | `ios-cuctl tunnel-status` | If `ready` is true with exactly one tunnel, reuse it; do not start another tunnel or WDA merely for screenshots, app launch, or hardware buttons. | CoreDevice screenshot, app list/activation, and hardware buttons without the Automation indicator. |
+
+On iOS 26 and earlier, touch, text, and accessibility inspection require Appium/WDA; USB plus WDA is the most reliable path unless a compatible preinstalled WDA build has been prepared for the persistent tunnel. CoreDevice remote touch is available on iOS 27 and later. A black iOS capture can mean the display is asleep: issue a reversible `press home`, take a new screenshot, and ask the user to unlock if interaction is needed. Never try to bypass the lock screen.
 
 ## Operation guides
 

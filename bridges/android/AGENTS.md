@@ -23,6 +23,16 @@ The controller uses `adb` and `scrcpy` from `PATH`. It also supports an optional
 
 If using that portable archive, retain its upstream `LICENSE`. Do not use binaries from an unofficial mirror.
 
+## Start a routine task
+
+For a host and phone that have already been configured, begin with:
+
+```bash
+"$HOME/android-computer-use/android-cuctl" devices
+```
+
+If exactly one wireless `HOST:PORT` target is already in `device` state, use it directly. Do not run `doctor`, `discover`, or `connect-auto` on every task. Use `doctor` for first-time setup or tool/connection troubleshooting; take a fresh screenshot next so a lock screen or changed UI is visible before input.
+
 ## First-time phone setup
 
 Wireless debugging needs no additional host installation. USB debugging may require the Ubuntu Android udev rules; if `android-cuctl devices` cannot see a USB-connected phone, run this once in a visible terminal and enter the local sudo password there:
@@ -68,6 +78,8 @@ The host can discover advertised services without copying addresses manually:
 
 `connect-auto` proceeds only when exactly one already-paired `_adb-tls-connect` target is visible. If multiple targets appear, inspect `discover` and connect the intended address explicitly.
 
+Android may stop advertising an mDNS service while the already-established ADB connection remains online. Check `devices` first: an existing wireless target in `device` state remains usable, and `connect-auto` reuses it without reconnecting. Run discovery only when no usable target is online.
+
 Do not expose legacy unauthenticated ADB-over-TCP port 5555 to a LAN or the Internet.
 
 ## Device selection
@@ -92,7 +104,7 @@ For any coordinate-based action:
 
 Screens can change due to animation, rotation, dialogs, the keyboard, or notifications, so never reuse old coordinates without a fresh screenshot. UIAutomator dumps may omit WebViews, games, videos, secure windows, or custom-rendered controls.
 
-`text-ascii` deliberately accepts only conservative ASCII. For Unicode text, use the on-screen keyboard through inspected taps, paste manually with the user's awareness, or install a trusted input-method helper only after explicit approval. Never place passwords, PINs, or one-time codes in command history or logs.
+`text-ascii` deliberately accepts only conservative ASCII. Some vendor keyboards leave injected text in an IME composing buffer instead of committing it immediately. Inspect the after-action screenshot; use `key KEYCODE_ENTER` only when committing that text is the intended reversible action. For Unicode text, use the on-screen keyboard through inspected taps, paste manually with the user's awareness, or install a trusted input-method helper only after explicit approval. Never place passwords, PINs, or one-time codes in command history or logs.
 
 Use `android-cuctl mirror` for live scrcpy viewing. If an agent must control the scrcpy window itself, it must also load the `wayland-computer-use` skill and follow that skill's desktop-control rules.
 

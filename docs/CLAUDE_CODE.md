@@ -35,7 +35,7 @@ cd mobile-computer-use
 /ios-computer-use 检查已连接的 iPhone
 ```
 
-也可以用自然语言触发，例如“截一张安卓手机当前屏幕”或“打开 iPhone 上的某个 App 并检查页面”。Claude 应先读取安装在 home 目录中的 `AGENTS.md`，再运行 `doctor` 和 `devices`。
+也可以用自然语言触发，例如“截一张安卓手机当前屏幕”或“打开 iPhone 上的某个 App 并检查页面”。Claude 应先完整读取安装在 home 目录中的 `AGENTS.md`。日常任务走快速探测：Android 先运行 `devices`，iOS 常驻服务先运行 `tunnel-status`；`doctor` 用于首次配置或故障排查，不必每次执行。
 
 在 shell 中先做只读验证：
 
@@ -56,14 +56,22 @@ cd mobile-computer-use
 3. Android 11+ 可使用 Wireless debugging：先 `pair`，再用主界面显示的调试端口执行 `connect`。
 4. 多设备在线时设置精确的 `ANDROID_SERIAL`，不要让 agent 猜设备。
 
-已配对设备再次上线时，可直接自动发现并连接：
+已配对设备再次上线时，先检查现有连接：
+
+```bash
+"$HOME/android-computer-use/android-cuctl" devices
+```
+
+如果恰好一个无线 `HOST:PORT` 已处于 `device` 状态，直接复用，不要等待 mDNS。只有没有在线目标时才运行：
 
 ```bash
 "$HOME/android-computer-use/android-cuctl" discover
 "$HOME/android-computer-use/android-cuctl" connect-auto
 ```
 
-`connect-auto` 只会在局域网中恰好发现一个已配对 connect 服务时继续；多个设备时必须显式选择。
+`connect-auto` 会直接复用唯一的在线无线目标；否则只会在局域网中恰好发现一个已配对 connect 服务时继续。mDNS 广播消失不代表已建立的 ADB 连接不可用。多个设备时必须显式选择。
+
+每次坐标输入前都先截新图。部分厂商输入法会把 `text-ascii` 留在拼写/候选状态；检查操作后截图，仅在确认需要提交该文本时再发送 `KEYCODE_ENTER`。
 
 完整操作说明见安装后的 `$HOME/android-computer-use/AGENTS.md`。
 
@@ -97,7 +105,7 @@ sudo systemctl enable --now "ios-computer-use-tunneld@$(id -un).service"
 "$HOME/ios-computer-use/ios-cuctl" tunnel-status
 ```
 
-完全无线使用时，在一个终端持续运行：
+未安装上述 systemd 服务时，完全无线使用需在一个终端持续运行：
 
 ```bash
 "$HOME/ios-computer-use/ios-cuctl" wifi-tunnel-start
@@ -107,7 +115,9 @@ sudo systemctl enable --now "ios-computer-use-tunneld@$(id -un).service"
 
 已安装上面的 systemd 服务时，不要再运行 `wifi-tunnel-start`；bridge 会从端口 `49151` 自动发现并复用常驻 tunnel。
 
-锁屏时仍可使用 CoreDevice 截图和硬件键；WDA accessibility、触控和文字输入必须由用户先解锁设备，不能绕过锁屏。
+日常无线操作先运行 `tunnel-status`。`ready: true` 且只有一个 tunnel 时，直接使用 `screenshot`、`apps`、`activate` 或 `press`，不要重复发现、启动 tunnel 或启动 WDA；这些 CoreDevice 操作不会显示 Automation Running。`registry_ready: true` 但 `ready: false` 表示后台服务在线、手机 tunnel 不在线，此时让手机保持唤醒且 Wi-Fi 开启，并确认与主机处于同一局域网。
+
+iOS 26 及更早版本的触控、文字输入和 accessibility 仍需要 Appium/WDA，除非已经准备好兼容 persistent preinstalled launch 的 WDA v13+ 包，否则 USB + WDA 最可靠；iOS 27+ 可直接使用 CoreDevice 触控。锁屏时可以尝试 CoreDevice 截图和硬件键，但屏幕休眠可能先得到全黑截图：发送一次可逆的 Home 键、重新截图，再由用户解锁后继续，不能绕过锁屏。
 
 完整操作、环境变量和恢复说明见安装后的 `$HOME/ios-computer-use/AGENTS.md`。
 

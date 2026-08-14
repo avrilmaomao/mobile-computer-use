@@ -216,6 +216,12 @@ def device_udid(requested: str | None) -> str:
     registered = selected_registry_tunnel(requested)
     if registered:
         return registered[1]
+    active = active_tunnel_registry()
+    if active is not None and not usb_devices():
+        raise BridgeError(
+            "RemoteXPC registry is running but no iOS device tunnel is active; "
+            "keep the device awake with Wi-Fi enabled and confirm it is on the same LAN"
+        )
     return usb_device_udid(requested)
 
 
@@ -1142,15 +1148,21 @@ def cmd_doctor(args: argparse.Namespace) -> None:
     except BridgeError as exc:
         checks["device_error"] = str(exc)
     tunnel = active_tunnel_registry()
-    checks["remotexpc"] = (
-        {
-            "ready": True,
+    if tunnel:
+        active_udids = sorted((tunnel[1].get("tunnels") or {}).keys())
+        checks["remotexpc"] = {
+            "ready": bool(active_udids),
+            "registry_ready": True,
             "registry_port": tunnel[0],
-            "udids": sorted((tunnel[1].get("tunnels") or {}).keys()),
+            "udids": active_udids,
         }
-        if tunnel
-        else {"ready": False, "registry_port": read_tunnel_registry_port()}
-    )
+    else:
+        checks["remotexpc"] = {
+            "ready": False,
+            "registry_ready": False,
+            "registry_port": read_tunnel_registry_port(),
+            "udids": [],
+        }
     wifi_state = read_json_file(WIFI_TUNNEL_FILE)
     checks["wifi_tunnel"] = {
         "ready": wifi_tunnel_alive(wifi_state),
@@ -1191,7 +1203,36 @@ def cmd_wireless_on(args: argparse.Namespace) -> None:
 
 
 def cmd_wireless_browse(args: argparse.Namespace) -> None:
-    pmd3("remote", "browse")
+    result = pmd3("remote", "browse", "--timeout", "2", capture=True, timeout=10.0)
+    try:
+        discovered = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise BridgeError(f"could not parse RemoteXPC discovery: {exc}") from exc
+    if not isinstance(discovered, dict):
+        raise BridgeError("RemoteXPC discovery returned an invalid response")
+
+    summary: dict[str, list[dict[str, Any]]] = {}
+    for transport in ("usb", "wifi"):
+        unique: dict[tuple[str, str, int], dict[str, Any]] = {}
+        entries = discovered.get(transport)
+        if isinstance(entries, list):
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                identifier = str(entry.get("identifier") or "")
+                address = str(entry.get("address") or "")
+                try:
+                    port = int(entry.get("port") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if identifier and address and port:
+                    unique[(identifier, address, port)] = {
+                        "identifier": identifier,
+                        "address": address,
+                        "port": port,
+                    }
+        summary[transport] = [unique[key] for key in sorted(unique)]
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
 
 
 def cmd_wifi_tunnel_start(args: argparse.Namespace) -> None:
@@ -1284,7 +1325,17 @@ def cmd_wifi_tunnel_status(args: argparse.Namespace) -> None:
 def cmd_tunnel_status(args: argparse.Namespace) -> None:
     active = active_tunnel_registry()
     if active is None:
-        print(json.dumps({"ready": False, "registry_port": read_tunnel_registry_port()}, indent=2))
+        print(
+            json.dumps(
+                {
+                    "ready": False,
+                    "registry_ready": False,
+                    "registry_port": read_tunnel_registry_port(),
+                    "tunnels": {},
+                },
+                indent=2,
+            )
+        )
         return
     port, data = active
     tunnels = data.get("tunnels") or {}
@@ -1297,7 +1348,17 @@ def cmd_tunnel_status(args: argparse.Namespace) -> None:
         for udid, item in tunnels.items()
         if isinstance(item, dict)
     }
-    print(json.dumps({"ready": True, "registry_port": port, "tunnels": summary}, indent=2))
+    print(
+        json.dumps(
+            {
+                "ready": bool(summary),
+                "registry_ready": True,
+                "registry_port": port,
+                "tunnels": summary,
+            },
+            indent=2,
+        )
+    )
 
 
 def cmd_tunnel_start(args: argparse.Namespace) -> None:
@@ -1422,6 +1483,13 @@ def cmd_wda_status(args: argparse.Namespace) -> None:
 def cmd_status(args: argparse.Namespace) -> None:
     state = session_state(required=False)
     active = session_is_alive(state)
+    touch_supported: bool | None = None
+    device_error: str | None = None
+    if not active:
+        try:
+            touch_supported = coredevice_touch_supported(args.udid)
+        except BridgeError as exc:
+            device_error = str(exc)
     result = {
         "server_ready": appium_ready(),
         "session_active": active,
@@ -1430,12 +1498,16 @@ def cmd_status(args: argparse.Namespace) -> None:
             "appium-wda"
             if active
             else "coredevice-hid"
-            if coredevice_touch_supported(args.udid)
+            if touch_supported
             else "coredevice-screenshot-and-app-launch; appium-wda-on-demand-for-input"
+            if touch_supported is False
+            else "unavailable-no-device"
         ),
         "automation_indicator_expected": active,
         "log": str(APPIUM_LOG),
     }
+    if device_error:
+        result["device_error"] = device_error
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 

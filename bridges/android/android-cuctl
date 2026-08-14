@@ -159,7 +159,15 @@ case "$command" in
   discover)
     [[ $# -eq 0 ]] || fail "usage: android-cuctl discover"
     need_cmd adb
-    adb mdns services
+    services="$(adb mdns services)"
+    printf '%s\n' "$services"
+    if ! grep -q '_adb-' <<<"$services"; then
+      mapfile -t online_wireless < <(adb devices | awk 'NR > 1 && $2 == "device" && $1 ~ /:/ { print $1 }')
+      if [[ "${#online_wireless[@]}" -eq 1 ]]; then
+        printf 'No mDNS target is currently advertised; the existing wireless connection to %s remains usable.\n' \
+          "${online_wireless[0]}"
+      fi
+    fi
     ;;
 
   pair)
@@ -307,7 +315,7 @@ case "$command" in
   launch)
     [[ $# -eq 1 ]] || fail "usage: android-cuctl launch PACKAGE"
     [[ "$1" =~ ^[A-Za-z0-9._]+$ ]] || fail "invalid Android package name"
-    adb_device shell monkey -p "$1" -c android.intent.category.LAUNCHER 1 >/dev/null
+    adb_device shell monkey -p "$1" -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1
     ;;
 
   mirror)
