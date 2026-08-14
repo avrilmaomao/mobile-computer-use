@@ -95,6 +95,8 @@ To prove and use a fully wireless RemoteXPC path, keep this command running in a
 
 Linux shows one administrator authorization prompt because the tunnel creates a TUN interface. Once the command prints that the Wi-Fi tunnel is ready, ordinary `screenshot`, `press`, `start`, `source`, `tap-image`, `swipe-image`, and element commands automatically prefer that Wi-Fi RSD connection. Check it from another terminal with `wifi-tunnel-status`. Stop it with `Ctrl+C`; the bridge removes its transient state file. If USB is already unplugged, pass the known `--udid` before the subcommand and `--platform-version` after it when WDA/Appium input will be used.
 
+CoreDevice screenshots and hardware `press` can operate while the display is locked. WDA/Appium accessibility, touch, and text input require the device to be unlocked; if the phone locks during wireless WDA startup, iOS may terminate the XCTest connection. Never attempt to bypass the lock screen—ask the user to unlock and retry.
+
 For a tunnel started outside the bridge, set `IOS_CUCTL_RSD_ADDRESS`, `IOS_CUCTL_RSD_PORT`, `IOS_CUCTL_WIFI_UDID`, and optionally `IOS_CUCTL_WIFI_PLATFORM_VERSION`. Use `IOS_CUCTL_TRANSPORT=usb` to force the original USB tunnel while a Wi-Fi tunnel is running.
 
 Provide a WDA package signed for the target device and set:

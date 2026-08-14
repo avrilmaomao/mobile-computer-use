@@ -87,6 +87,8 @@ export IOS_CUCTL_WDA_BUNDLE_ID="your.signed.WebDriverAgentRunner.xctrunner"
 
 显示 ready 后，另一个终端里的 `screenshot`、`press`、WDA/Appium 输入和元素命令会自动复用 Wi‑Fi RSD。用 `wifi-tunnel-status` 确认状态；通过真实截图和一次可逆 Home 键操作验收。首次仍建议保留 USB 完成 Trust、配对、DeveloperDiskImage 和 WDA 安装。
 
+锁屏时仍可使用 CoreDevice 截图和硬件键；WDA accessibility、触控和文字输入必须由用户先解锁设备，不能绕过锁屏。
+
 完整操作、环境变量和恢复说明见安装后的 `$HOME/ios-computer-use/AGENTS.md`。
 
 ## 更新与卸载
