@@ -79,6 +79,7 @@ install_bridge() {
   if [[ "$platform" == "ios" ]]; then
     install_file 0755 "$repo_dir/bridges/ios/ios-cuctl" "$target_dir/ios-cuctl"
     install_file 0755 "$repo_dir/bridges/ios/wda-runner" "$target_dir/wda-runner"
+    install_file 0755 "$repo_dir/bridges/ios/ios-tunneld-runner" "$target_dir/ios-tunneld-runner"
     install_file 0644 "$repo_dir/bridges/ios/ios-computer-use-tunneld@.service" \
       "$target_dir/ios-computer-use-tunneld@.service"
   else

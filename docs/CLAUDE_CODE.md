@@ -19,6 +19,7 @@ cd mobile-computer-use
 ~/android-computer-use/AGENTS.md
 ~/ios-computer-use/ios-cuctl
 ~/ios-computer-use/wda-runner
+~/ios-computer-use/ios-tunneld-runner
 ~/ios-computer-use/ios-computer-use-tunneld@.service
 ~/ios-computer-use/AGENTS.md
 ```

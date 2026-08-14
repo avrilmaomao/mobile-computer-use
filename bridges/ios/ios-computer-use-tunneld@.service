@@ -8,8 +8,8 @@ Type=simple
 User=%i
 Group=%i
 Environment=HOME=/home/%i
-Environment=PATH=/home/%i/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
-ExecStart=/usr/bin/env pymobiledevice3 remote tunneld --host 127.0.0.1 --port 49151 --protocol tcp --usb --wifi --usbmux --mobdev2
+Environment=PATH=/home/%i/.local/share/uv/tools/pymobiledevice3/bin:/home/%i/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+ExecStart=/usr/bin/env python /home/%i/ios-computer-use/ios-tunneld-runner --host 127.0.0.1 --port 49151 --protocol tcp
 Restart=on-failure
 RestartSec=2
 
@@ -23,6 +23,7 @@ PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
 ReadWritePaths=/home/%i/.pymobiledevice3
+ReadOnlyPaths=/home/%i/ios-computer-use/ios-tunneld-runner
 ProtectControlGroups=true
 ProtectKernelModules=true
 ProtectKernelTunables=true

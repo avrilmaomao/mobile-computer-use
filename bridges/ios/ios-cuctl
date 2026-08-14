@@ -9,6 +9,7 @@ import json
 import os
 import pwd
 import re
+import shlex
 import shutil
 import signal
 import struct
@@ -16,12 +17,45 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
 
 
 HOME_DIR = Path.home()
+CONFIG_FILE = Path(
+    os.environ.get("IOS_CUCTL_CONFIG", HOME_DIR / ".config/ios-computer-use/env")
+).expanduser()
+
+
+def load_config_file(path: Path) -> None:
+    """Load simple IOS_CUCTL_* assignments without executing shell code."""
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise RuntimeError(f"could not read iOS bridge config {path}: {exc}") from exc
+    for number, raw_line in enumerate(lines, start=1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, separator, raw_value = line.partition("=")
+        key = key.strip()
+        if not separator or not re.fullmatch(r"IOS_CUCTL_[A-Z0-9_]+", key):
+            raise RuntimeError(f"invalid iOS bridge config at {path}:{number}")
+        try:
+            values = shlex.split(raw_value, comments=True, posix=True)
+        except ValueError as exc:
+            raise RuntimeError(f"invalid iOS bridge config at {path}:{number}: {exc}") from exc
+        if len(values) != 1:
+            raise RuntimeError(f"expected one value in iOS bridge config at {path}:{number}")
+        os.environ.setdefault(key, os.path.expandvars(values[0]))
+
+
+load_config_file(CONFIG_FILE)
+
 BRIDGE_DIR = Path(os.environ.get("IOS_CUCTL_HOME", HOME_DIR / "ios-computer-use")).expanduser()
 SHARE_DIR = Path(
     os.environ.get("IOS_CUCTL_SHARE_DIR", HOME_DIR / ".local/share/ios-computer-use")
@@ -64,6 +98,10 @@ class BridgeError(RuntimeError):
     pass
 
 
+class CommandTimeout(BridgeError):
+    pass
+
+
 def die(message: str, code: int = 1) -> None:
     print(f"error: {message}", file=sys.stderr)
     raise SystemExit(code)
@@ -73,8 +111,17 @@ def ensure_state_dir() -> None:
     STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
 
 
-def run(cmd: list[str], *, capture: bool = False, check: bool = True) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(cmd, text=True, capture_output=capture)
+def run(
+    cmd: list[str],
+    *,
+    capture: bool = False,
+    check: bool = True,
+    timeout: float | None = None,
+) -> subprocess.CompletedProcess[str]:
+    try:
+        result = subprocess.run(cmd, text=True, capture_output=capture, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        raise CommandTimeout(f"command timed out after {timeout:g}s: {' '.join(cmd)}") from exc
     if check and result.returncode != 0:
         if capture:
             if result.stdout:
@@ -85,10 +132,15 @@ def run(cmd: list[str], *, capture: bool = False, check: bool = True) -> subproc
     return result
 
 
-def pmd3(*args: str, capture: bool = False, check: bool = True) -> subprocess.CompletedProcess[str]:
+def pmd3(
+    *args: str,
+    capture: bool = False,
+    check: bool = True,
+    timeout: float | None = None,
+) -> subprocess.CompletedProcess[str]:
     if not PMD3.is_file():
         raise BridgeError(f"pymobiledevice3 is missing: {PMD3}")
-    return run([str(PMD3), *args], capture=capture, check=check)
+    return run([str(PMD3), *args], capture=capture, check=check, timeout=timeout)
 
 
 def wda_python() -> Path:
@@ -111,6 +163,8 @@ def wda_python() -> Path:
 
 def usb_devices() -> list[dict[str, Any]]:
     result = pmd3("usbmux", "list", capture=True)
+    if not result.stdout.strip():
+        return []
     try:
         data = json.loads(result.stdout)
     except json.JSONDecodeError as exc:
@@ -144,6 +198,14 @@ def select_device(requested: str | None) -> dict[str, Any]:
     return devices[0]
 
 
+def usb_device_udid(requested: str | None) -> str:
+    device = select_device(requested)
+    value = device.get("Identifier") or device.get("UniqueDeviceID")
+    if not value:
+        raise BridgeError("selected USB device has no UDID")
+    return str(value)
+
+
 def device_udid(requested: str | None) -> str:
     wireless = wifi_rsd_context()
     if wireless:
@@ -151,11 +213,10 @@ def device_udid(requested: str | None) -> str:
         if value:
             return str(value)
         raise BridgeError("wireless tunnel state has no UDID; pass --udid")
-    device = select_device(requested)
-    value = device.get("Identifier") or device.get("UniqueDeviceID")
-    if not value:
-        raise BridgeError("selected device has no UDID")
-    return str(value)
+    registered = selected_registry_tunnel(requested)
+    if registered:
+        return registered[1]
+    return usb_device_udid(requested)
 
 
 def read_json_file(path: Path) -> dict[str, Any] | None:
@@ -193,17 +254,36 @@ def read_tunnel_registry_port() -> int | None:
 
 
 def tunnel_registry(port: int, *, timeout: float = 2.0) -> dict[str, Any] | None:
-    request = urllib.request.Request(
-        f"http://127.0.0.1:{port}/remotexpc/tunnels",
-        method="GET",
-        headers={"Accept": "application/json"},
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            parsed = json.loads(response.read())
-    except (urllib.error.URLError, json.JSONDecodeError, TimeoutError):
-        return None
-    return parsed if isinstance(parsed, dict) else None
+    for endpoint in ("/remotexpc/tunnels", "/"):
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{port}{endpoint}",
+            method="GET",
+            headers={"Accept": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                parsed = json.loads(response.read())
+        except (urllib.error.URLError, json.JSONDecodeError, TimeoutError):
+            continue
+        if not isinstance(parsed, dict):
+            continue
+        if endpoint == "/remotexpc/tunnels":
+            return parsed
+        normalized: dict[str, Any] = {}
+        for udid, entries in parsed.items():
+            if not isinstance(entries, list) or not entries or not isinstance(entries[0], dict):
+                continue
+            entry = entries[0]
+            address = entry.get("tunnel-address")
+            rsd_port = entry.get("tunnel-port")
+            if address and rsd_port:
+                normalized[str(udid)] = {
+                    "address": address,
+                    "rsdPort": rsd_port,
+                    "services": {},
+                }
+        return {"tunnels": normalized}
+    return None
 
 
 def active_tunnel_registry() -> tuple[int, dict[str, Any]] | None:
@@ -226,6 +306,37 @@ def active_tunnel_registry() -> tuple[int, dict[str, Any]] | None:
     return fallback
 
 
+def selected_registry_tunnel(
+    requested: str | None,
+) -> tuple[int, str, dict[str, Any]] | None:
+    active = active_tunnel_registry()
+    if active is None:
+        return None
+    port, data = active
+    tunnels = data.get("tunnels")
+    if not isinstance(tunnels, dict) or not tunnels:
+        return None
+    if requested:
+        wanted = normalize_udid(requested)
+        matches = [
+            (str(udid), tunnel)
+            for udid, tunnel in tunnels.items()
+            if normalize_udid(str(udid)) == wanted and isinstance(tunnel, dict)
+        ]
+        if len(matches) != 1:
+            return None
+        udid, tunnel = matches[0]
+        return port, udid, tunnel
+    matches = [(str(udid), tunnel) for udid, tunnel in tunnels.items() if isinstance(tunnel, dict)]
+    if len(matches) > 1:
+        ids = ", ".join(sorted(udid for udid, _ in matches))
+        raise BridgeError(f"multiple tunneled devices found; pass --udid. Devices: {ids}")
+    if not matches:
+        return None
+    udid, tunnel = matches[0]
+    return port, udid, tunnel
+
+
 def ensure_remote_xpc(udid: str) -> dict[str, Any]:
     active = active_tunnel_registry()
     if active is None:
@@ -240,6 +351,42 @@ def ensure_remote_xpc(udid: str) -> dict[str, Any]:
     # Keep the user's Strongbox pointer synchronized before session creation.
     write_tunnel_registry_port(port)
     return {"port": port, "udid": udid, "tunnel": tunnels[udid]}
+
+
+def rebuild_registered_tunnel(
+    udid: str,
+    previous_address: str,
+    previous_port: int,
+    *,
+    timeout: float = 30.0,
+) -> tuple[str, int, str]:
+    active = active_tunnel_registry()
+    if active is None:
+        raise BridgeError("cannot rebuild RemoteXPC tunnel: registry is unavailable")
+    registry_port, _ = active
+    query = urllib.parse.urlencode({"udid": udid})
+    try:
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{registry_port}/cancel?{query}", timeout=3.0
+        ) as response:
+            response.read()
+    except (urllib.error.URLError, TimeoutError) as exc:
+        raise BridgeError(f"could not request RemoteXPC tunnel rebuild: {exc}") from exc
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        data = tunnel_registry(registry_port)
+        tunnels = data.get("tunnels") if isinstance(data, dict) else None
+        if isinstance(tunnels, dict):
+            for candidate_udid, tunnel in tunnels.items():
+                if normalize_udid(str(candidate_udid)) != normalize_udid(udid) or not isinstance(tunnel, dict):
+                    continue
+                address = str(tunnel.get("address") or "")
+                rsd_port = int(tunnel.get("rsdPort") or 0)
+                if address and rsd_port and (address, rsd_port) != (previous_address, previous_port):
+                    return address, rsd_port, str(candidate_udid)
+        time.sleep(0.5)
+    raise BridgeError(f"RemoteXPC tunnel for {udid} was not rebuilt within {timeout:g}s")
 
 
 def requested_transport() -> str:
@@ -305,13 +452,74 @@ def hid_rsd(requested_udid: str | None) -> tuple[str, int, str]:
     return address, rsd_port, udid
 
 
+def pmd3_over_rsd(
+    requested_udid: str | None,
+    *args: str,
+    capture: bool = False,
+    check: bool = True,
+    timeout: float = 20.0,
+) -> subprocess.CompletedProcess[str]:
+    address, rsd_port, udid = hid_rsd(requested_udid)
+
+    def invoke(endpoint_address: str, endpoint_port: int) -> subprocess.CompletedProcess[str]:
+        return pmd3(
+            *args,
+            "--rsd",
+            endpoint_address,
+            str(endpoint_port),
+            capture=True,
+            check=False,
+            timeout=timeout,
+        )
+
+    def is_retryable(result: subprocess.CompletedProcess[str]) -> bool:
+        combined = f"{result.stdout or ''}\n{result.stderr or ''}"
+        return any(
+            marker in combined
+            for marker in (
+                "TimeoutError",
+                "ConnectionRefusedError",
+                "ConnectionResetError",
+                "No route to host",
+                "Connection refused",
+                "Network is unreachable",
+            )
+        )
+
+    try:
+        result = invoke(address, rsd_port)
+    except CommandTimeout:
+        if wifi_rsd_context() is not None:
+            raise
+        address, rsd_port, _ = rebuild_registered_tunnel(udid, address, rsd_port)
+        result = invoke(address, rsd_port)
+    else:
+        if result.returncode != 0 and is_retryable(result) and wifi_rsd_context() is None:
+            address, rsd_port, _ = rebuild_registered_tunnel(udid, address, rsd_port)
+            result = invoke(address, rsd_port)
+
+    if check and result.returncode != 0:
+        if result.stdout:
+            print(result.stdout, end="", file=sys.stderr)
+        if result.stderr:
+            print(result.stderr, end="", file=sys.stderr)
+        raise BridgeError(f"RemoteXPC command failed ({result.returncode}): {' '.join(args)}")
+    if not capture:
+        if result.stdout:
+            print(result.stdout, end="")
+        if result.stderr:
+            print(result.stderr, end="", file=sys.stderr)
+    return result
+
+
 def device_major_version(requested_udid: str | None) -> int:
     wireless = wifi_rsd_context()
-    version = (
-        str(wireless.get("platform_version") or "0")
-        if wireless
-        else str(select_device(requested_udid).get("ProductVersion") or "0")
-    )
+    if wireless:
+        version = str(wireless.get("platform_version") or "0")
+    elif registered := selected_registry_tunnel(requested_udid):
+        version = str(registered[2].get("productVersion") or "0")
+    else:
+        version = str(select_device(requested_udid).get("ProductVersion") or "0")
     try:
         return int(version.split(".", 1)[0])
     except ValueError:
@@ -651,6 +859,7 @@ def start_session(args: argparse.Namespace) -> None:
         return
     if existing:
         SESSION_FILE.unlink(missing_ok=True)
+    appium_managed_wda = False
     wireless = wifi_rsd_context()
     if wireless:
         udid = args.udid or str(wireless.get("udid") or "")
@@ -666,26 +875,38 @@ def start_session(args: argparse.Namespace) -> None:
             },
         }
     else:
-        device = select_device(args.udid)
-        udid = str(device.get("Identifier") or device.get("UniqueDeviceID"))
-        platform_version = str(device.get("ProductVersion"))
-        mount_developer_image(udid)
-        tunnel_info = ensure_remote_xpc(udid)
-    runner_state = start_wda_runner(tunnel_info, args.wda_bundle_id)
+        registered = selected_registry_tunnel(args.udid)
+        if registered:
+            port, udid, tunnel = registered
+            platform_version = str(tunnel.get("productVersion") or "0")
+            tunnel_info = {"port": port, "udid": udid, "transport": "wifi", "tunnel": tunnel}
+            appium_managed_wda = True
+        else:
+            device = select_device(args.udid)
+            udid = str(device.get("Identifier") or device.get("UniqueDeviceID"))
+            platform_version = str(device.get("ProductVersion"))
+            mount_developer_image(udid)
+            tunnel_info = ensure_remote_xpc(udid)
     start_server()
-    wda_address = str(runner_state["address"])
-    wda_host = f"[{wda_address}]" if ":" in wda_address else wda_address
-    wda_url = f"http://{wda_host}:8100"
+    wda_url: str | None = None
     capabilities: dict[str, Any] = {
         "platformName": "iOS",
         "appium:automationName": "XCUITest",
         "appium:udid": udid,
-        "appium:webDriverAgentUrl": wda_url,
         "appium:noReset": True,
         "appium:newCommandTimeout": 3600,
         "appium:wdaLaunchTimeout": 90000,
         "appium:wdaConnectionTimeout": 90000,
     }
+    if appium_managed_wda:
+        capabilities["appium:usePreinstalledWDA"] = True
+        capabilities["appium:updatedWDABundleId"] = args.wda_bundle_id.removesuffix(".xctrunner")
+    else:
+        runner_state = start_wda_runner(tunnel_info, args.wda_bundle_id)
+        wda_address = str(runner_state["address"])
+        wda_host = f"[{wda_address}]" if ":" in wda_address else wda_address
+        wda_url = f"http://{wda_host}:8100"
+        capabilities["appium:webDriverAgentUrl"] = wda_url
     if platform_version != "0":
         capabilities["appium:platformVersion"] = platform_version
     if args.bundle_id:
@@ -759,17 +980,18 @@ def capture_any_screenshot(output: Path, requested_udid: str | None = None) -> P
     if session_is_alive(session_state(required=False)):
         return capture_session_screenshot(output)
     output.parent.mkdir(parents=True, exist_ok=True)
-    address, rsd_port, _ = hid_rsd(requested_udid)
-    pmd3(
-        "developer",
-        "core-device",
-        "screen-capture",
-        "screenshot",
-        str(output),
-        "--rsd",
-        address,
-        str(rsd_port),
-    )
+    try:
+        pmd3_over_rsd(
+            requested_udid,
+            "developer",
+            "core-device",
+            "screen-capture",
+            "screenshot",
+            str(output),
+        )
+    except BridgeError:
+        output.unlink(missing_ok=True)
+        raise
     return output
 
 
@@ -810,17 +1032,14 @@ def image_to_hid(path: Path, x: float, y: float) -> tuple[int, int, dict[str, An
 
 
 def hid_tap(requested_udid: str | None, x: int, y: int) -> None:
-    address, rsd_port, _ = hid_rsd(requested_udid)
-    pmd3(
+    pmd3_over_rsd(
+        requested_udid,
         "developer",
         "core-device",
         "universal-hid-service",
         "tap",
         str(x),
         str(y),
-        "--rsd",
-        address,
-        str(rsd_port),
     )
 
 
@@ -832,8 +1051,8 @@ def hid_drag(
     y2: int,
     duration_ms: int,
 ) -> None:
-    address, rsd_port, _ = hid_rsd(requested_udid)
-    pmd3(
+    pmd3_over_rsd(
+        requested_udid,
         "developer",
         "core-device",
         "universal-hid-service",
@@ -844,9 +1063,6 @@ def hid_drag(
         str(y2),
         "--duration",
         str(duration_ms / 1000),
-        "--rsd",
-        address,
-        str(rsd_port),
     )
 
 
@@ -949,15 +1165,26 @@ def cmd_devices(args: argparse.Namespace) -> None:
 
 def cmd_info(args: argparse.Namespace) -> None:
     wireless = wifi_rsd_context()
-    print(json.dumps(wireless or select_device(args.udid), ensure_ascii=False, indent=2))
+    registered = selected_registry_tunnel(args.udid) if not wireless else None
+    if registered:
+        port, udid, tunnel = registered
+        value: dict[str, Any] = {
+            "Identifier": udid,
+            "ConnectionType": "WiFiTunnel",
+            "RegistryPort": port,
+            "Tunnel": tunnel,
+        }
+    else:
+        value = wireless or select_device(args.udid)
+    print(json.dumps(value, ensure_ascii=False, indent=2))
 
 
 def cmd_pair(args: argparse.Namespace) -> None:
-    pmd3("lockdown", "pair", "--udid", device_udid(args.udid))
+    pmd3("lockdown", "pair", "--udid", usb_device_udid(args.udid))
 
 
 def cmd_wireless_on(args: argparse.Namespace) -> None:
-    udid = device_udid(args.udid)
+    udid = usb_device_udid(args.udid)
     pmd3("lockdown", "wifi-connections", "--state", "on", "--udid", udid)
     pmd3("lockdown", "remotepairing", "--pair", "--udid", udid)
     print("Wi-Fi connections and RemotePairing are enabled. Keep both devices on the same LAN.")
@@ -1108,30 +1335,40 @@ def cmd_tunnel_start(args: argparse.Namespace) -> None:
 
 
 def cmd_mount(args: argparse.Namespace) -> None:
-    mount_developer_image(device_udid(args.udid))
+    mount_developer_image(usb_device_udid(args.udid))
 
 
 def cmd_install_wda(args: argparse.Namespace) -> None:
     ipa = Path(args.ipa).resolve()
     if not ipa.is_file():
         raise BridgeError(f"WDA package does not exist: {ipa}")
-    pmd3("apps", "install", "--developer", str(ipa), "--udid", device_udid(args.udid))
+    pmd3("apps", "install", "--developer", str(ipa), "--udid", usb_device_udid(args.udid))
 
 
 def cmd_apps(args: argparse.Namespace) -> None:
-    wireless = wifi_rsd_context()
-    if wireless:
-        pmd3(
-            "apps",
-            "list",
-            "--type",
-            args.type,
-            "--rsd",
-            str(wireless["address"]),
-            str(wireless["rsd_port"]),
-        )
-    else:
+    if wifi_rsd_context() is None and selected_registry_tunnel(args.udid) is None:
         pmd3("apps", "list", "--type", args.type, "--udid", device_udid(args.udid))
+        return
+    result = pmd3_over_rsd(
+        args.udid,
+        "developer",
+        "core-device",
+        "list-apps",
+        capture=True,
+    )
+    try:
+        apps = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise BridgeError(f"could not parse CoreDevice app list: {exc}") from exc
+    if not isinstance(apps, list):
+        raise BridgeError("CoreDevice returned an invalid app list")
+    if args.type == "System":
+        apps = [app for app in apps if isinstance(app, dict) and app.get("isFirstParty")]
+    elif args.type == "User":
+        apps = [app for app in apps if isinstance(app, dict) and not app.get("isFirstParty")]
+    elif args.type == "Hidden":
+        apps = [app for app in apps if isinstance(app, dict) and app.get("isHidden")]
+    print(json.dumps(apps, ensure_ascii=False, indent=2))
 
 
 def cmd_start(args: argparse.Namespace) -> None:
@@ -1194,7 +1431,7 @@ def cmd_status(args: argparse.Namespace) -> None:
             if active
             else "coredevice-hid"
             if coredevice_touch_supported(args.udid)
-            else "coredevice-screenshot; appium-wda-on-demand-for-input"
+            else "coredevice-screenshot-and-app-launch; appium-wda-on-demand-for-input"
         ),
         "automation_indicator_expected": active,
         "log": str(APPIUM_LOG),
@@ -1329,17 +1566,14 @@ def cmd_tap_element(args: argparse.Namespace) -> None:
 
 def cmd_press(args: argparse.Namespace) -> None:
     if not session_is_alive(session_state(required=False)):
-        address, rsd_port, _ = hid_rsd(args.udid)
         name = {"volumeUp": "volume-up", "volumeDown": "volume-down"}.get(args.name, args.name)
-        pmd3(
+        pmd3_over_rsd(
+            args.udid,
             "developer",
             "core-device",
             "hid",
             "button",
             name,
-            "--rsd",
-            address,
-            str(rsd_port),
         )
         return
     session_request(
@@ -1350,7 +1584,16 @@ def cmd_press(args: argparse.Namespace) -> None:
 
 
 def cmd_activate(args: argparse.Namespace) -> None:
-    ensure_wda_session(args.udid)
+    if not session_is_alive(session_state(required=False)):
+        pmd3_over_rsd(
+            args.udid,
+            "developer",
+            "core-device",
+            "launch-application",
+            args.bundle_id,
+            "",
+        )
+        return
     session_request("POST", "/appium/device/activate_app", {"bundleId": args.bundle_id})
 
 
