@@ -17,6 +17,7 @@ MOBILE = REPO / "bridges/mobile/mobile-cuctl"
 ANDROID = REPO / "bridges/android/android-cuctl"
 RECONNECT = REPO / "bridges/android/android-auto-reconnect"
 INSTALL = REPO / "install.sh"
+TUNNELD = REPO / "bridges/ios/ios-tunneld-runner"
 
 
 def run(command: list[str], *, env: dict[str, str] | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -299,6 +300,82 @@ class InstallerTests(unittest.TestCase):
             self.assertTrue((home / "android-computer-use/android-auto-reconnect").is_file())
             self.assertTrue((home / ".config/systemd/user/android-computer-use-reconnect.service").is_file())
             self.assertIn("did not enable it in an isolated install home", result.stdout)
+
+
+class TunnelSelectionTests(unittest.TestCase):
+    """A device can hold both a Wi-Fi and a USB tunnel; publishing the stale one
+    breaks every WebDriverAgent launch, so selection must follow reachability."""
+
+    def load(self):
+        import importlib.util
+
+        spec = importlib.util.spec_from_loader("ios_tunneld_runner", loader=None)
+        module = importlib.util.module_from_spec(spec)
+        source = TUNNELD.read_text(encoding="utf-8")
+        # Import the selection logic without pulling in pymobiledevice3/fastapi.
+        head = source.split("class CompatibleTunneldRunner", 1)[1]
+        body = "class CompatibleTunneldRunner" + head.split("    async def _tunnel_reachable", 1)[0]
+        exec("from typing import Any\n" + body, module.__dict__)
+        return module.CompatibleTunneldRunner
+
+    def build(self, cls, tunnels, preferred=None):
+        instance = cls.__new__(cls)
+        instance._preferred_tunnel = dict(preferred or {})
+
+        class Task:
+            def __init__(self, udid, tunnel):
+                self.udid = udid
+                self.tunnel = tunnel
+
+        class Core:
+            def __init__(self):
+                self.tunnel_tasks = {i: Task(u, t) for i, (u, t) in enumerate(tunnels)}
+
+        class Runner:
+            def __init__(self):
+                self._tunneld_core = Core()
+
+        instance.runner = Runner()
+        return instance
+
+    def tunnel(self, address, port, interface):
+        class Tunnel:
+            def __init__(self):
+                self.address = address
+                self.port = port
+                self.interface = interface
+
+        return Tunnel()
+
+    def test_prefers_the_tunnel_health_checks_confirmed(self) -> None:
+        cls = self.load()
+        stale = self.tunnel("fd00::1", 100, "tun0")
+        live = self.tunnel("fd11::1", 200, "tun1")
+        instance = self.build(
+            cls,
+            [("UDID", stale), ("UDID", live)],
+            preferred={"UDID": ("fd11::1", 200)},
+        )
+        self.assertEqual(instance._active_tunnels()["UDID"].address, "fd11::1")
+
+    def test_falls_back_to_the_first_tunnel_before_any_probe(self) -> None:
+        cls = self.load()
+        first = self.tunnel("fd00::1", 100, "tun0")
+        second = self.tunnel("fd11::1", 200, "tun1")
+        instance = self.build(cls, [("UDID", first), ("UDID", second)])
+        self.assertEqual(instance._active_tunnels()["UDID"].address, "fd00::1")
+
+    def test_reports_one_entry_per_device(self) -> None:
+        cls = self.load()
+        instance = self.build(
+            cls,
+            [
+                ("A", self.tunnel("fd00::1", 100, "tun0")),
+                ("A", self.tunnel("fd11::1", 200, "tun1")),
+                ("B", self.tunnel("fd22::1", 300, "tun2")),
+            ],
+        )
+        self.assertEqual(sorted(instance._active_tunnels()), ["A", "B"])
 
 
 if __name__ == "__main__":

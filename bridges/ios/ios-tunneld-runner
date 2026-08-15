@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import time
 from contextlib import asynccontextmanager, suppress
 from typing import Any
@@ -29,6 +30,8 @@ HEALTH_INTERVAL_SECONDS = 15.0
 HEALTH_CONNECT_TIMEOUT_SECONDS = 10.0
 HEALTH_FAILURE_LIMIT = 4
 INTERFACE_REMOVAL_DELAY_SECONDS = 1.0
+# Rounds with no reachable tunnel before the service restarts itself.
+SELF_RESTART_ROUNDS = 8
 
 
 class CompatibleTunneldRunner:
@@ -48,14 +51,36 @@ class CompatibleTunneldRunner:
         self._catalog_tasks: dict[tuple[str, int], asyncio.Task[dict[str, Any]]] = {}
         self._health_failures: dict[tuple[str, str, int], int] = {}
         self._health_first_seen: dict[tuple[str, str, int], float] = {}
+        self._preferred_tunnel: dict[str, tuple[str, int]] = {}
+        self._unreachable_rounds = 0
         self._install_appium_routes()
         self._install_health_watchdog()
 
-    def _active_tunnels(self) -> dict[str, Any]:
-        result: dict[str, Any] = {}
+    def _tunnels_by_udid(self) -> dict[str, list[Any]]:
+        grouped: dict[str, list[Any]] = {}
         for active in self.runner._tunneld_core.tunnel_tasks.values():
-            if active.udid and active.tunnel and active.udid not in result:
-                result[active.udid] = active.tunnel
+            if active.udid and active.tunnel:
+                grouped.setdefault(active.udid, []).append(active.tunnel)
+        return grouped
+
+    def _active_tunnels(self) -> dict[str, Any]:
+        """Pick one tunnel per device, preferring the one proven reachable.
+
+        Attaching USB while a Wi-Fi tunnel runs leaves a device with two tunnel
+        tasks. Publishing whichever appeared first can hand out an endpoint the
+        phone no longer answers on, which fails every WebDriverAgent launch on
+        both transports and previously needed a service restart to clear.
+        """
+        result: dict[str, Any] = {}
+        for udid, tunnels in self._tunnels_by_udid().items():
+            chosen = tunnels[0]
+            preferred = self._preferred_tunnel.get(udid)
+            if preferred is not None:
+                for tunnel in tunnels:
+                    if (str(tunnel.address), int(tunnel.port)) == preferred:
+                        chosen = tunnel
+                        break
+            result[udid] = chosen
         return result
 
     async def _tunnel_reachable(self, address: str, port: int) -> bool:
@@ -103,38 +128,64 @@ class CompatibleTunneldRunner:
     async def _health_watchdog(self) -> None:
         while True:
             await asyncio.sleep(HEALTH_INTERVAL_SECONDS)
-            active = self._active_tunnels()
+            grouped = self._tunnels_by_udid()
             current_keys: set[tuple[str, str, int]] = set()
-            for udid, tunnel in active.items():
-                key = (udid, str(tunnel.address), int(tunnel.port))
-                current_keys.add(key)
-                first_seen = self._health_first_seen.setdefault(key, time.monotonic())
-                if time.monotonic() - first_seen < HEALTH_INTERVAL_SECONDS:
-                    continue
-                if await self._tunnel_reachable(key[1], key[2]):
+            any_reachable = False
+            for udid, tunnels in grouped.items():
+                for tunnel in tunnels:
+                    key = (udid, str(tunnel.address), int(tunnel.port))
+                    current_keys.add(key)
+                    first_seen = self._health_first_seen.setdefault(key, time.monotonic())
+                    if time.monotonic() - first_seen < HEALTH_INTERVAL_SECONDS:
+                        continue
+                    if await self._tunnel_reachable(key[1], key[2]):
+                        # Publish the endpoint the phone actually answers on, so a
+                        # device holding both a Wi-Fi and a USB tunnel needs no
+                        # restart to become usable again.
+                        self._preferred_tunnel[udid] = (key[1], key[2])
+                        self._health_failures.pop(key, None)
+                        any_reachable = True
+                        continue
+                    failures = self._health_failures.get(key, 0) + 1
+                    self._health_failures[key] = failures
+                    if failures < HEALTH_FAILURE_LIMIT:
+                        continue
+                    LOGGER.warning(
+                        "RemoteXPC tunnel for %s is unreachable at %s:%s; rebuilding it",
+                        udid,
+                        key[1],
+                        key[2],
+                    )
+                    interface = str(getattr(tunnel, "interface", "") or "")
+                    if self._preferred_tunnel.get(udid) == (key[1], key[2]):
+                        self._preferred_tunnel.pop(udid, None)
+                    with suppress(KeyError):
+                        self.runner._tunneld_core.cancel(udid)
+                    await self._remove_interface(interface)
                     self._health_failures.pop(key, None)
-                    continue
-                failures = self._health_failures.get(key, 0) + 1
-                self._health_failures[key] = failures
-                if failures < HEALTH_FAILURE_LIMIT:
-                    continue
-                LOGGER.warning(
-                    "RemoteXPC tunnel for %s is unreachable at %s:%s; rebuilding it",
-                    udid,
-                    key[1],
-                    key[2],
-                )
-                interface = str(getattr(tunnel, "interface", "") or "")
-                with suppress(KeyError):
-                    self.runner._tunneld_core.cancel(udid)
-                await self._remove_interface(interface)
-                self._health_failures.pop(key, None)
-                self._health_first_seen.pop(key, None)
+                    self._health_first_seen.pop(key, None)
 
             stale_keys = set(self._health_first_seen) - current_keys
             for key in stale_keys:
                 self._health_first_seen.pop(key, None)
                 self._health_failures.pop(key, None)
+            for udid in set(self._preferred_tunnel) - set(grouped):
+                self._preferred_tunnel.pop(udid, None)
+
+            # Rebuilding in place cannot fix every wedged state. Exiting lets
+            # systemd restart the service under its existing capability grant,
+            # which clears the tunnels and interfaces without asking anyone for
+            # a password.
+            if grouped and not any_reachable:
+                self._unreachable_rounds += 1
+                if self._unreachable_rounds >= SELF_RESTART_ROUNDS:
+                    LOGGER.error(
+                        "no tunnel has been reachable for %.0f seconds; exiting so systemd restarts the service",
+                        SELF_RESTART_ROUNDS * HEALTH_INTERVAL_SECONDS,
+                    )
+                    os._exit(1)
+            else:
+                self._unreachable_rounds = 0
 
     def _install_health_watchdog(self) -> None:
         app = self.runner._app

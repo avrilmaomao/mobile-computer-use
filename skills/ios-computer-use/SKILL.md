@@ -18,7 +18,7 @@ For an already configured wireless device, start with the lightweight persistent
 
 If `tunnel-status` reports `ready: true` with exactly one tunnel, reuse it. Do not run raw discovery, start another tunnel, or start WDA for screenshots, app listing/activation, or hardware buttons. Use `doctor` and `devices` for first-time setup, USB work, or troubleshooting.
 
-`tunnel-status` also reports `interfaces.unassociated`. When that list is non-empty and WDA fails to launch while screenshots still succeed, the leftover TUN devices are misrouting WebDriverAgent's device-to-host callback; ask the user to restart `ios-computer-use-tunneld@USER.service`. Do not raise `wdaLaunchTimeout` for this, and do not trust Appium's claim that the WDA build is broken or the device is locked — verify both before acting on it.
+If WDA fails to launch while screenshots still succeed, the tunnel is the suspect, not the WDA build. Do not raise `wdaLaunchTimeout`, and do not act on Appium's claim that the package is broken or the device is locked without checking both. The service repairs tunnel drift on its own: it removes the interface behind each tunnel it rebuilds, publishes whichever endpoint its health check last reached when a device holds two tunnels, and restarts itself through systemd after two minutes with nothing reachable. Wait one or two 15-second probe intervals and retry before escalating. Ask the user to restart `ios-computer-use-tunneld@USER.service` only to load a new build of the bridge.
 
 For a longer task, prefer the unified session preflight. It verifies the persistent tunnel, saves baseline and ready screenshots, inhibits host sleep without sudo, and can prewarm one reusable WDA session when input is needed:
 
