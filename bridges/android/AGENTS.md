@@ -80,22 +80,35 @@ Prefer Android 11 or newer's **Wireless debugging** pairing flow. Keep the phone
 3. Use the separate address shown on the main Wireless debugging screen with `android-cuctl connect PHONE_IP:DEBUG_PORT`.
 4. Confirm with `android-cuctl devices`.
 
-The host can discover advertised services without copying addresses manually:
+After that first manual `connect`, the bridge remembers the endpoint, and one command recovers the phone from then on:
 
 ```bash
-"$HOME/android-computer-use/android-cuctl" discover
 "$HOME/android-computer-use/android-cuctl" connect-auto
 ```
 
-`connect-auto` proceeds only when exactly one already-paired `_adb-tls-connect` target is visible. If multiple targets appear, inspect `discover` and connect the intended address explicitly.
+`connect-auto` walks a recovery ladder in cost order and stops at the first rung that works, printing which one succeeded:
 
-Android may stop advertising an mDNS service while the already-established ADB connection remains online. Check `devices` first: an existing wireless target in `device` state remains usable, and `connect-auto` reuses it without reconnecting. Run discovery only when no usable target is online.
+| Rung | Handles | Typical cost |
+|---|---|---|
+| Reuse the online target | nothing broke | ~0.1s |
+| Remembered `HOST:PORT` | ADB server restarted, host rebooted, link dropped | ~0.5s |
+| Remembered MAC's current address | DHCP moved the phone | ~2s |
+| mDNS `_adb-tls-connect` | a phone that was never connected from this host | ~5s |
+| Port scan of that address | Wireless debugging was toggled, so the port changed | ~10s, needs python3 |
+
+Every rung confirms the result with a real `get-state` query, because `adb connect` exits 0 even when it prints `failed to connect`. When a hardware serial is remembered, a target reporting a different serial is rejected rather than used, so a phone that inherited the address cannot be driven by mistake. Clear that memory with `android-cuctl target --clear` when the device genuinely changed; inspect it with `android-cuctl target`.
+
+`discover` remains available for inspecting raw mDNS advertisements. Do not depend on it: adb's bundled `adb discovery` responder routinely sees nothing when UDP 5353 is shared with avahi-daemon or a browser, and `adb mdns check` still reports success in that state. `doctor` prints the backend name and the number of visible services so this is obvious rather than inferred.
+
+Android may also stop advertising while an established ADB connection stays fully usable, which is why reuse is the first rung rather than discovery.
+
+When every rung fails, `connect-auto` prints what it observed — whether the address answers ARP, which mDNS backend ran and how many services it saw, whether the port scan ran or was skipped — followed by ordered next steps. Read that report before improvising; it distinguishes "phone is off this LAN" from "port changed" from "python3 missing".
 
 Do not expose legacy unauthenticated ADB-over-TCP port 5555 to a LAN or the Internet.
 
 ### Optional no-sudo automatic reconnect
 
-The installer includes a per-user systemd service that checks existing connections first and calls `connect-auto` only when no wireless target is online. `connect-auto` still refuses zero or multiple paired mDNS targets. Enable it without sudo:
+The installer includes a per-user systemd service that checks existing connections first and calls `connect-auto` only when no wireless target is online. `connect-auto` still refuses to guess between multiple paired targets. Enable it without sudo:
 
 ```bash
 systemctl --user enable --now android-computer-use-reconnect.service

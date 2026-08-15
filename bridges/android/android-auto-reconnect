@@ -10,8 +10,9 @@ usage() {
 Usage: android-auto-reconnect [--once]
 
 Reuse an existing wireless ADB connection, or run android-cuctl connect-auto
-when no wireless target is online. connect-auto proceeds only for one unique,
-already-paired mDNS target.
+when no wireless target is online. connect-auto proceeds only for the remembered
+device or one unique, already-paired target, and verifies the hardware serial
+before accepting it.
 EOF
 }
 
@@ -57,10 +58,10 @@ probe() {
   fi
 
   local output
-  if output="$("$controller" connect-auto 2>&1)"; then
+  if output="$("$controller" connect-auto 2>/dev/null)"; then
     report_once "reconnected" "$(tr '\n' ' ' <<<"$output" | sed 's/[[:space:]]*$//')"
   else
-    report_once "waiting" "no unique paired mDNS target"
+    report_once "waiting" "phone not reachable; run 'android-cuctl connect-auto' for the diagnosis"
   fi
 }
 

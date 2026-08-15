@@ -4,7 +4,7 @@ Constrained, agent-friendly bridges for inspecting and operating user-authorized
 
 The repository contains two Agent Skills and their home-directory controllers:
 
-- `android-computer-use`: ADB and scrcpy device discovery, mDNS auto-connect for a unique paired target, screenshots, UI dumps, taps, swipes, text, key events, app launch, and USB/Wi-Fi debugging.
+- `android-computer-use`: ADB and scrcpy device discovery, one-command wireless recovery that survives address and port changes without relying on mDNS, screenshots, UI dumps, taps, swipes, text, key events, app launch, and USB/Wi-Fi debugging.
 - `ios-computer-use`: pymobiledevice3, RemoteXPC, CoreDevice, Appium, and WebDriverAgent screenshots, accessibility inspection, coordinate conversion, input, app activation, and USB/Wi-Fi setup.
 
 It also installs `~/mobile-cuctl/mobile-cuctl`, a no-sudo session controller for connection reuse, WDA prewarming, Android stay-awake, host sleep inhibition, restricted flow execution, recording orchestration, and safe periodic cleanup.
@@ -73,7 +73,7 @@ Setup and troubleshooting use `doctor`; routine operation should probe the small
 
 | Platform | Routine probe | Reuse rule | Main wireless capabilities |
 |---|---|---|---|
-| Android | `android-cuctl devices` | If exactly one `HOST:PORT` target is already `device`, use it directly; mDNS discovery is unnecessary. | Screenshot, UI dump, tap, swipe, ASCII text, key events, app launch, and scrcpy. |
+| Android | `android-cuctl devices` | If exactly one `HOST:PORT` target is already `device`, use it directly; otherwise `connect-auto` recovers it in one command. | Screenshot, UI dump, tap, swipe, ASCII text, key events, app launch, and scrcpy. |
 | iOS | `ios-cuctl tunnel-status` | If `ready` is true with exactly one tunnel, reuse it; do not start another tunnel or WDA merely for screenshots, app launch, or hardware buttons. | CoreDevice screenshot, app list/activation, and hardware buttons without the Automation indicator. |
 
 On iOS 26 and earlier, touch, text, and accessibility inspection require Appium/WDA; USB plus WDA is the most reliable path unless a compatible preinstalled WDA build has been prepared for the persistent tunnel. CoreDevice remote touch is available on iOS 27 and later. A black iOS capture can mean the display is asleep: issue a reversible `press home`, take a new screenshot, and ask the user to unlock if interaction is needed. Never try to bypass the lock screen.

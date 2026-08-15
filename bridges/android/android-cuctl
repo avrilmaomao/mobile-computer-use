@@ -22,7 +22,8 @@ Connection and status:
   discover                       List Android Wireless Debugging mDNS services
   pair HOST:PORT                 Pair using Android 11+ Wireless debugging
   connect HOST[:PORT]            Connect to a paired wireless device
-  connect-auto                   Connect when exactly one paired mDNS target is advertised
+  connect-auto                   Reconnect the remembered device, or one unique paired target
+  target [--clear]               Show or clear the remembered wireless target
   disconnect [HOST[:PORT]]       Disconnect one or all wireless devices
   serial                         Print the selected authorized device serial
   info                           Print basic selected-device information
@@ -54,6 +55,12 @@ Recording:
 Set ANDROID_SERIAL to select an exact authorized device when multiple devices
 are present. Relative output FILE names are stored under:
   $ANDROID_CUCTL_HOME/captures (default: the controller's captures directory)
+
+'connect-auto' recovers the phone in cost order: an already online target, the
+remembered HOST:PORT, that MAC's current address, mDNS, then a port scan of the
+remembered address (needs python3). Each step is confirmed with a real ADB state
+check and rejected if the hardware serial no longer matches the remembered one.
+A successful 'connect' or 'connect-auto' refreshes what is remembered.
 EOF
 }
 
@@ -128,6 +135,205 @@ read_state_value() {
   [[ -f "$file" ]] || return 1
   IFS= read -r REPLY <"$file"
   printf '%s\n' "$REPLY"
+}
+
+target_file="$state_dir/last-target.env"
+
+target_get() {
+  local line
+  [[ -f "$target_file" ]] || return 1
+  line="$(grep -m1 "^$1=" "$target_file" 2>/dev/null)" || return 1
+  line="${line#*=}"
+  [[ -n "$line" ]] || return 1
+  printf '%s\n' "$line"
+}
+
+online_wireless_targets() {
+  adb devices | awk 'NR > 1 && $2 == "device" && $1 ~ /:/ { print $1 }'
+}
+
+# adb connect exits 0 even when it prints "failed to connect", so every step of
+# the recovery ladder confirms the result with a real state query instead.
+verify_connected() {
+  [[ "$(adb -s "$1" get-state 2>/dev/null || true)" == "device" ]]
+}
+
+device_property() {
+  adb -s "$1" shell getprop "$2" 2>/dev/null | tr -d '\r\n'
+}
+
+neighbour_mac() {
+  ip neigh show 2>/dev/null | awk -v h="$1" '$1 == h && /lladdr/ { print tolower($5); exit }'
+}
+
+host_for_mac() {
+  local found
+  found="$(ip neigh show 2>/dev/null | awk -v m="$1" '$1 ~ /\./ && /lladdr/ && tolower($5) == m { print $1; exit }')"
+  [[ -n "$found" ]] || return 1
+  printf '%s\n' "$found"
+}
+
+remember_target() {
+  local endpoint="$1"
+  local host="${endpoint%:*}"
+  mkdir -p "$state_dir"
+  (
+    umask 077
+    {
+      printf 'HOST=%s\n' "$host"
+      printf 'PORT=%s\n' "${endpoint##*:}"
+      printf 'MAC=%s\n' "$(neighbour_mac "$host")"
+      printf 'SERIAL=%s\n' "$(device_property "$endpoint" ro.serialno)"
+      printf 'MODEL=%s\n' "$(device_property "$endpoint" ro.product.model)"
+      printf 'UPDATED=%s\n' "$(date --iso-8601=seconds)"
+    } >"$target_file"
+  )
+}
+
+# Connect, prove the target is really online, and refuse a different phone that
+# has taken the remembered address.
+try_connect() {
+  local endpoint="$1" known observed attempt
+  # adbd briefly refuses a new TLS connection right after a disconnect, so a
+  # single attempt reports a false negative on an otherwise healthy phone.
+  for attempt in 1 2 3; do
+    verify_connected "$endpoint" && break
+    adb connect "$endpoint" >/dev/null 2>&1 || true
+    verify_connected "$endpoint" && break
+    if [[ "$attempt" -eq 3 ]]; then
+      adb disconnect "$endpoint" >/dev/null 2>&1 || true
+      return 1
+    fi
+    sleep 0.4
+  done
+  known="$(target_get SERIAL || true)"
+  if [[ -n "$known" ]]; then
+    observed="$(device_property "$endpoint" ro.serialno)"
+    if [[ -n "$observed" && "$observed" != "$known" ]]; then
+      adb disconnect "$endpoint" >/dev/null 2>&1 || true
+      fail "$endpoint is a different device (serial $observed, remembered $known); run 'android-cuctl target --clear' first"
+    fi
+  fi
+  remember_target "$endpoint"
+}
+
+# 'adb mdns check' reports success even when discovery is blind, so the backend
+# name is the only useful signal: the bundled "adb discovery" responder routinely
+# sees nothing when UDP 5353 is shared with avahi or a browser.
+mdns_backend_name() {
+  adb mdns check 2>/dev/null | sed -n 's/.*\[\(.*\)\].*/\1/p'
+}
+
+mdns_connect_endpoints() {
+  adb mdns services 2>/dev/null | awk '$2 == "_adb-tls-connect._tcp" { print $3 }'
+}
+
+host_lan_prefix() {
+  local addr
+  addr="$(ip -4 route get 1.1.1.1 2>/dev/null |
+    awk '{ for (i = 1; i < NF; i++) if ($i == "src") { print $(i + 1); exit } }')"
+  [[ "$addr" =~ ^([0-9]+\.[0-9]+\.[0-9]+)\. ]] || return 1
+  printf '%s\n' "${BASH_REMATCH[1]}"
+}
+
+refresh_neighbours() {
+  local prefix="$1" i
+  for i in $(seq 1 254); do
+    ping -c1 -W1 "$prefix.$i" >/dev/null 2>&1 &
+  done
+  wait
+}
+
+# Recovery has several independent failure modes, so report which rung of the
+# ladder was actually reachable rather than a single unhelpful message.
+report_recovery_failure() {
+  local host="$1"
+  {
+    printf '\nconnect-auto could not reach the phone. What the bridge saw:\n\n'
+
+    if [[ -f "$target_file" ]]; then
+      printf '  remembered   %s:%s (%s, serial %s, updated %s)\n' \
+        "$(target_get HOST || printf '?')" "$(target_get PORT || printf '?')" \
+        "$(target_get MODEL || printf 'unknown')" "$(target_get SERIAL || printf 'unknown')" \
+        "$(target_get UPDATED || printf '?')"
+    else
+      printf '  remembered   nothing\n'
+    fi
+
+    if [[ -n "$host" ]]; then
+      if [[ -n "$(neighbour_mac "$host")" ]]; then
+        printf '  LAN          %s answers ARP, so the address is live\n' "$host"
+      else
+        printf '  LAN          %s does not answer ARP; the phone is off this network or asleep\n' "$host"
+      fi
+    fi
+
+    printf '  mDNS         %s backend saw %s _adb-tls-connect service(s)\n' \
+      "$(mdns_backend_name || printf 'unknown')" "$(mdns_connect_endpoints | grep -c . || true)"
+
+    if command -v python3 >/dev/null 2>&1; then
+      printf '  port scan    ran against %s and found no wireless debugging port\n' "${host:-no address}"
+    else
+      printf '  port scan    skipped: python3 is not installed\n'
+    fi
+
+    printf '\nTry in this order:\n'
+    printf '  1. On the phone: Settings > Developer options > Wireless debugging is ON\n'
+    printf '     and it shows an "IP address & Port". Toggling it off/on assigns a new port.\n'
+    printf '  2. Confirm the phone and this host share one LAN and one subnet\n'
+    printf '     (guest Wi-Fi and AP isolation both break ADB).\n'
+    printf "  3. Read the phone's current IP:PORT off that screen and run:\n"
+    printf '       android-cuctl connect HOST:PORT\n'
+    printf '     which re-teaches the bridge the new endpoint.\n'
+    printf '  4. If pairing was lost, re-pair from "Pair device with pairing code":\n'
+    printf '       android-cuctl pair HOST:PORT\n'
+    printf '  5. Still stuck: connect USB, run android-cuctl doctor, and check the RSA prompt.\n'
+  } >&2
+}
+
+scan_ports() {
+  local host="$1" first="$2" last="$3"
+  command -v python3 >/dev/null 2>&1 || return 1
+  python3 - "$host" "$first" "$last" <<'PY'
+import asyncio
+import sys
+
+host, first, last = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+limit = asyncio.Semaphore(512)
+
+
+async def probe(port):
+    async with limit:
+        try:
+            _, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port), timeout=1.0
+            )
+        except Exception:
+            return
+        print(port, flush=True)
+        writer.close()
+
+
+async def main():
+    await asyncio.gather(*(probe(p) for p in range(first, last + 1)))
+
+
+asyncio.run(main())
+PY
+}
+
+# Wireless debugging picks an ephemeral port; this is the range Android uses.
+scan_and_connect() {
+  local host="$1" port
+  printf 'scan: probing %s for a wireless debugging port\n' "$host" >&2
+  while read -r port; do
+    [[ -n "$port" ]] || continue
+    if try_connect "$host:$port"; then
+      printf '%s\n' "$host:$port"
+      return 0
+    fi
+  done < <(scan_ports "$host" 30000 49999)
+  return 1
 }
 
 process_start_ticks() {
@@ -255,6 +461,21 @@ case "$command" in
     fi
 
     if command -v adb >/dev/null 2>&1; then
+      printf 'adb mDNS: %s backend, %s service(s) visible\n' \
+        "$(mdns_backend_name || printf 'unknown')" "$(mdns_connect_endpoints | grep -c . || true)"
+      printf '  0 services with the phone online means discovery is blind here;\n'
+      printf '  connect-auto falls back to the remembered target, which is the normal path\n'
+    fi
+
+    if [[ -f "$target_file" ]]; then
+      printf 'Remembered target: %s:%s (%s, updated %s)\n' \
+        "$(target_get HOST || printf '?')" "$(target_get PORT || printf '?')" \
+        "$(target_get MODEL || printf 'unknown model')" "$(target_get UPDATED || printf '?')"
+    else
+      printf 'Remembered target: none (run connect HOST:PORT once)\n'
+    fi
+
+    if command -v adb >/dev/null 2>&1; then
       printf '\nADB devices:\n'
       adb devices -l
     fi
@@ -292,31 +513,81 @@ case "$command" in
     [[ $# -eq 1 ]] || fail "usage: android-cuctl connect HOST[:PORT]"
     need_cmd adb
     [[ "$1" != *[[:space:]]* ]] || fail "host must not contain whitespace"
-    adb connect "$1"
+    endpoint="$1"
+    [[ "$endpoint" == *:* ]] || endpoint="$endpoint:5555"
+    try_connect "$endpoint" || fail "failed to connect to $endpoint; confirm Wireless debugging is on and the pairing is still valid"
+    printf 'connected to %s\n' "$endpoint"
     ;;
 
   connect-auto)
     [[ $# -eq 0 ]] || fail "usage: android-cuctl connect-auto"
     need_cmd adb
-    mapfile -t online_wireless < <(adb devices | awk 'NR > 1 && $2 == "device" && $1 ~ /:/ { print $1 }')
+
+    mapfile -t online_wireless < <(online_wireless_targets)
     if [[ "${#online_wireless[@]}" -eq 1 ]]; then
+      remember_target "${online_wireless[0]}"
       printf 'already connected to %s\n' "${online_wireless[0]}"
       exit 0
     elif [[ "${#online_wireless[@]}" -gt 1 ]]; then
       fail "multiple wireless ADB targets are already online; set ANDROID_SERIAL explicitly"
     fi
-    mapfile -t endpoints < <(adb mdns services | awk '$2 == "_adb-tls-connect._tcp" { print $3 }')
-    case "${#endpoints[@]}" in
-      0)
-        fail "no paired Wireless Debugging connect service was discovered"
-        ;;
-      1)
-        adb connect "${endpoints[0]}"
-        ;;
-      *)
-        fail "multiple Wireless Debugging targets were discovered; use 'discover' and connect the intended HOST:PORT"
-        ;;
+
+    cached_host="$(target_get HOST || true)"
+    cached_port="$(target_get PORT || true)"
+    cached_mac="$(target_get MAC || true)"
+
+    if [[ -n "$cached_host" && -n "$cached_port" ]] && try_connect "$cached_host:$cached_port"; then
+      printf 'connected to %s:%s (remembered)\n' "$cached_host" "$cached_port"
+      exit 0
+    fi
+
+    # The phone kept its port but DHCP moved it; its Wi-Fi MAC is stable per SSID.
+    current_host=""
+    if [[ -n "$cached_mac" && -n "$cached_port" ]]; then
+      prefix="$(host_lan_prefix || true)"
+      [[ -n "$prefix" ]] && refresh_neighbours "$prefix"
+      if current_host="$(host_for_mac "$cached_mac")" && [[ "$current_host" != "$cached_host" ]]; then
+        if try_connect "$current_host:$cached_port"; then
+          printf 'connected to %s:%s (address moved)\n' "$current_host" "$cached_port"
+          exit 0
+        fi
+      fi
+    fi
+
+    mapfile -t endpoints < <(mdns_connect_endpoints)
+    if [[ "${#endpoints[@]}" -gt 1 ]]; then
+      fail "multiple Wireless Debugging targets were discovered; use 'discover' and connect the intended HOST:PORT"
+    fi
+    if [[ "${#endpoints[@]}" -eq 1 ]] && try_connect "${endpoints[0]}"; then
+      printf 'connected to %s (mDNS)\n' "${endpoints[0]}"
+      exit 0
+    fi
+
+    # Toggling Wireless debugging assigns a new ephemeral port, which no cache can
+    # predict and a broken mDNS backend cannot report.
+    scan_host="${current_host:-$cached_host}"
+    if [[ -n "$scan_host" ]] && found="$(scan_and_connect "$scan_host")"; then
+      printf 'connected to %s (port scan)\n' "$found"
+      exit 0
+    fi
+
+    report_recovery_failure "$scan_host"
+    fail "no wireless device recovered"
+    ;;
+
+  target)
+    case "$#" in
+      0) ;;
+      1) [[ "$1" == "--clear" ]] || fail "usage: android-cuctl target [--clear]" ;;
+      *) fail "usage: android-cuctl target [--clear]" ;;
     esac
+    if [[ "${1:-}" == "--clear" ]]; then
+      rm -f "$target_file"
+      printf 'remembered target cleared\n'
+      exit 0
+    fi
+    [[ -f "$target_file" ]] || fail "no remembered target yet"
+    cat "$target_file"
     ;;
 
   disconnect)

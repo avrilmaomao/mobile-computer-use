@@ -66,14 +66,17 @@ cd mobile-computer-use
 "$HOME/android-computer-use/android-cuctl" devices
 ```
 
-如果恰好一个无线 `HOST:PORT` 已处于 `device` 状态，直接复用，不要等待 mDNS。只有没有在线目标时才运行：
+如果恰好一个无线 `HOST:PORT` 已处于 `device` 状态，直接复用。没有在线目标时，只需要一条命令：
 
 ```bash
-"$HOME/android-computer-use/android-cuctl" discover
 "$HOME/android-computer-use/android-cuctl" connect-auto
 ```
 
-`connect-auto` 会直接复用唯一的在线无线目标；否则只会在局域网中恰好发现一个已配对 connect 服务时继续。mDNS 广播消失不代表已建立的 ADB 连接不可用。多个设备时必须显式选择。
+`connect-auto` 按代价从低到高逐级恢复，命中哪一级就打印哪一级：复用在线目标 → 记住的 `HOST:PORT` → 该 MAC 当前的地址（应对 DHCP 换 IP）→ mDNS → 对该地址做端口扫描（应对用户关开无线调试导致端口变化，需要 python3）。每一级都用真实的 `get-state` 校验，因为 `adb connect` 打印 `failed to connect` 时退出码仍是 0；记住硬件序列号后，序列号对不上的设备会被拒绝而不是被误用。
+
+不要把 mDNS 当主路径：当 UDP 5353 被 avahi 或浏览器占用时，adb 自带的 `adb discovery` 响应器经常什么都发现不了，而 `adb mdns check` 依旧报成功。`doctor` 会直接打印后端名称和可见服务数量。
+
+全部失败时 `connect-auto` 会输出观测到的事实（地址是否响应 ARP、mDNS 后端和服务数、端口扫描是否执行）和按顺序的排查步骤 —— 先读这份报告。用 `target` 查看、`target --clear` 清除记住的目标。多个设备时必须显式选择。
 
 需要后台自动恢复时启用普通用户服务，不需要 sudo：
 

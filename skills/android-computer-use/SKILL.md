@@ -26,7 +26,9 @@ For a longer control or recording task, prefer the unified session preflight. It
 
 Use `"$HOME/android-computer-use/android-cuctl" --help` for the supported command surface. Prefer this constrained command over raw `adb shell`.
 
-For wireless debugging with no online target, use `discover` to inspect mDNS advertisements and `connect-auto` only when exactly one already-paired connect target is present. mDNS advertisements may disappear while an existing ADB connection remains fully usable. First-time pairing still requires the phone's displayed pairing address and one-time code.
+With no online target, run `connect-auto`. It is a single self-recovering command: it reuses an online target, then the remembered `HOST:PORT`, then that MAC's current address, then mDNS, then a port scan of that address, and it prints which rung succeeded. Each rung is confirmed with a real ADB state check and rejected when the hardware serial no longer matches the remembered device.
+
+Do not rely on `discover`/mDNS as the primary path. adb's bundled responder often sees nothing when UDP 5353 is shared with avahi or a browser, while `adb mdns check` still reports success; `doctor` prints the backend and visible-service count. When `connect-auto` exhausts every rung it prints what it observed plus ordered next steps — read that report instead of improvising. Inspect or reset what is remembered with `target` and `target --clear`. First-time pairing still requires the phone's displayed pairing address and one-time code.
 
 For coordinate-based actions, take a fresh screenshot, inspect it with the available image-viewing tool, act, then take another screenshot to verify the resulting state. Use `ui-dump` when visible labels or bounds help, but do not assume every UI exposes an accessibility tree.
 
