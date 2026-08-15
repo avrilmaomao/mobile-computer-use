@@ -17,9 +17,17 @@ from pymobiledevice3.tunneld.server import TunneldRunner
 
 
 LOGGER = logging.getLogger("ios-computer-use.tunneld")
-HEALTH_INTERVAL_SECONDS = 5.0
-HEALTH_CONNECT_TIMEOUT_SECONDS = 3.0
-HEALTH_FAILURE_LIMIT = 2
+# A rebuild tears down the RemoteXPC tunnel, and with it any XCTest session
+# running over it, so WebDriverAgent dies with "Exiting due to IDE
+# disconnection". A phone that power-saves its Wi-Fi radio misses probes
+# routinely, so an eager watchdog destroys healthy tunnels: these settings
+# previously allowed ~10 seconds of jitter to trigger a rebuild and produced
+# 111 rebuilds in one day, and wireless WDA only ever succeeded during the two
+# hours that happened to stay quiet. Recovering a genuinely dead tunnel a
+# minute later is cheaper than cancelling live work.
+HEALTH_INTERVAL_SECONDS = 15.0
+HEALTH_CONNECT_TIMEOUT_SECONDS = 10.0
+HEALTH_FAILURE_LIMIT = 4
 INTERFACE_REMOVAL_DELAY_SECONDS = 1.0
 
 
