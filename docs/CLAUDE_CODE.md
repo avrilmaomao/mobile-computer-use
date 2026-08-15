@@ -144,6 +144,10 @@ sudo systemctl enable --now "ios-computer-use-tunneld@$(id -un).service"
 
 日常无线操作先运行 `tunnel-status`。`ready: true` 且只有一个 tunnel 时，直接使用 `screenshot`、`apps`、`activate` 或 `press`，不要重复发现、启动 tunnel 或启动 WDA；这些 CoreDevice 操作不会显示 Automation Running。`registry_ready: true` 但 `ready: false` 表示后台服务在线、手机 tunnel 不在线，此时让手机保持唤醒且 Wi-Fi 开启，并确认与主机处于同一局域网。
 
+如果截图正常但 WDA 起不来，先看 `tunnel-status` 的 `interfaces.unassociated`。被取消的 tunnel 会留下 persist 型 TUN 设备，每个都带自己的 ULA `/64` 路由；主机→设备方向（截图、`apps`、`press`、`activate`）照常，但 WDA 需要设备**反向回连主机**，这个回调会落到错误的接口上。设备日志是 `Exiting due to IDE disconnection`，主机侧是 `Connection closed while waiting for proxied service`。tunneld 现在会在重建时删掉旧接口；旧版本残留的用 `sudo systemctl restart "ios-computer-use-tunneld@$(id -un).service"` 清掉。**不要调大 `wdaLaunchTimeout`** —— 链路是断的不是慢的。Appium 报的"WDA 没构建好或设备锁屏"在这种情况下是误导，先验证再相信。
+
+`start` 在常驻注册表下会先试 Appium 的 preinstalled WDA，30 秒不成就自动降级到 bridge 自带的 XCTest runner，无需手工设置环境变量。
+
 iOS 26 及更早版本的触控、文字输入和 accessibility 仍需要 Appium/WDA，除非已经准备好兼容 persistent preinstalled launch 的 WDA v13+ 包，否则 USB + WDA 最可靠；iOS 27+ 可直接使用 CoreDevice 触控。锁屏时可以尝试 CoreDevice 截图和硬件键，但屏幕休眠可能先得到全黑截图：发送一次可逆的 Home 键、重新截图，再由用户解锁后继续，不能绕过锁屏。
 
 完整操作、环境变量和恢复说明见安装后的 `$HOME/ios-computer-use/AGENTS.md`。

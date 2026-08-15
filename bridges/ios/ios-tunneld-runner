@@ -20,6 +20,7 @@ LOGGER = logging.getLogger("ios-computer-use.tunneld")
 HEALTH_INTERVAL_SECONDS = 5.0
 HEALTH_CONNECT_TIMEOUT_SECONDS = 3.0
 HEALTH_FAILURE_LIMIT = 2
+INTERFACE_REMOVAL_DELAY_SECONDS = 1.0
 
 
 class CompatibleTunneldRunner:
@@ -63,6 +64,34 @@ class CompatibleTunneldRunner:
         except (OSError, TimeoutError):
             return False
 
+    async def _remove_interface(self, name: str) -> None:
+        """Delete the TUN device a cancelled tunnel leaves behind.
+
+        pymobiledevice3 creates persistent TUN devices, so cancelling the tunnel
+        task frees the task but not the interface. Each leftover keeps its own
+        ULA /64 route on the host, and once several accumulate the kernel starts
+        answering WebDriverAgent's device-to-host callback from the wrong
+        interface. Host-to-device traffic still works, so screenshots keep
+        succeeding while every WDA launch dies with "Exiting due to IDE
+        disconnection" until the service is restarted.
+
+        The name always comes from the tunnel object pymobiledevice3 built, so
+        this never touches an interface owned by anything else.
+        """
+        if not name:
+            return
+        await asyncio.sleep(INTERFACE_REMOVAL_DELAY_SECONDS)
+        process = await asyncio.create_subprocess_exec(
+            "ip",
+            "link",
+            "delete",
+            name,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        if await process.wait() == 0:
+            LOGGER.warning("removed leftover tunnel interface %s", name)
+
     async def _health_watchdog(self) -> None:
         while True:
             await asyncio.sleep(HEALTH_INTERVAL_SECONDS)
@@ -87,8 +116,10 @@ class CompatibleTunneldRunner:
                     key[1],
                     key[2],
                 )
+                interface = str(getattr(tunnel, "interface", "") or "")
                 with suppress(KeyError):
                     self.runner._tunneld_core.cancel(udid)
+                await self._remove_interface(interface)
                 self._health_failures.pop(key, None)
                 self._health_first_seen.pop(key, None)
 

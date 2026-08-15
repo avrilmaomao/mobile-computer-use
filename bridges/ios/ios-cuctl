@@ -88,6 +88,8 @@ WDA_RUNNER_LOG = STATE_DIR / "wda-runner.log"
 WIFI_TUNNEL_FILE = STATE_DIR / "wifi-tunnel.json"
 WDA_RUNNER = Path(os.environ.get("IOS_CUCTL_WDA_RUNNER", BRIDGE_DIR / "wda-runner")).expanduser()
 DEFAULT_TUNNEL_REGISTRY_PORT = 42314
+WDA_LAUNCH_TIMEOUT_MS = 90000
+PREINSTALLED_WDA_LAUNCH_TIMEOUT_MS = 30000
 SYSTEM_TUNNEL_REGISTRY_PORT = int(os.environ.get("IOS_CUCTL_SYSTEM_TUNNEL_PORT", "49151"))
 TUNNEL_PORT_FILE = Path(
     os.environ.get(
@@ -904,28 +906,60 @@ def start_session(args: argparse.Namespace) -> None:
         "appium:udid": udid,
         "appium:noReset": True,
         "appium:newCommandTimeout": 3600,
-        "appium:wdaLaunchTimeout": 90000,
+        "appium:wdaLaunchTimeout": WDA_LAUNCH_TIMEOUT_MS,
         "appium:wdaConnectionTimeout": 90000,
     }
-    if appium_managed_wda:
+    def attach_preinstalled() -> None:
+        capabilities.pop("appium:webDriverAgentUrl", None)
         capabilities["appium:usePreinstalledWDA"] = True
         capabilities["appium:updatedWDABundleId"] = args.wda_bundle_id.removesuffix(".xctrunner")
-    else:
+        # A healthy preinstalled runner answers within seconds; waiting the full
+        # launch timeout only delays the fallback that actually works.
+        capabilities["appium:wdaLaunchTimeout"] = PREINSTALLED_WDA_LAUNCH_TIMEOUT_MS
+
+    def attach_managed_runner() -> str:
+        capabilities.pop("appium:usePreinstalledWDA", None)
+        capabilities.pop("appium:updatedWDABundleId", None)
+        capabilities["appium:wdaLaunchTimeout"] = WDA_LAUNCH_TIMEOUT_MS
         runner_state = start_wda_runner(tunnel_info, args.wda_bundle_id)
-        wda_address = str(runner_state["address"])
-        wda_host = f"[{wda_address}]" if ":" in wda_address else wda_address
-        wda_url = f"http://{wda_host}:8100"
-        capabilities["appium:webDriverAgentUrl"] = wda_url
+        address = str(runner_state["address"])
+        host = f"[{address}]" if ":" in address else address
+        url = f"http://{host}:8100"
+        capabilities["appium:webDriverAgentUrl"] = url
+        return url
+
+    if appium_managed_wda:
+        attach_preinstalled()
+    else:
+        wda_url = attach_managed_runner()
     if platform_version != "0":
         capabilities["appium:platformVersion"] = platform_version
     if args.bundle_id:
         capabilities["appium:bundleId"] = args.bundle_id
-    response = http_json(
-        "POST",
-        "/session",
-        {"capabilities": {"alwaysMatch": capabilities, "firstMatch": [{}]}},
-        timeout=180.0,
-    )
+
+    def create_session() -> dict[str, Any]:
+        return http_json(
+            "POST",
+            "/session",
+            {"capabilities": {"alwaysMatch": capabilities, "firstMatch": [{}]}},
+            timeout=180.0,
+        )
+
+    try:
+        response = create_session()
+    except BridgeError as exc:
+        # Appium's preinstalled-WDA strategy cannot hold the XCTest session on
+        # every iOS build; it times out with a message blaming the WDA build or
+        # a locked device even when both are fine. The bridge's own XCTest
+        # runner does hold it, so fall back rather than surfacing that error.
+        if not (appium_managed_wda and "WebDriverAgent" in str(exc)):
+            raise
+        print(
+            "preinstalled WebDriverAgent did not start; retrying with the bridge's XCTest runner",
+            file=sys.stderr,
+        )
+        wda_url = attach_managed_runner()
+        response = create_session()
     value = response.get("value")
     sid = response.get("sessionId")
     if not sid and isinstance(value, dict):
@@ -1325,6 +1359,33 @@ def cmd_wifi_tunnel_status(args: argparse.Namespace) -> None:
     print(json.dumps({"ready": wifi_tunnel_alive(state), "state": state}, ensure_ascii=False, indent=2))
 
 
+def host_tun_devices() -> list[str]:
+    """List the host's TUN devices.
+
+    A cancelled RemoteXPC tunnel can leave its device behind, and each leftover
+    keeps a ULA /64 route that misroutes WebDriverAgent's device-to-host
+    callback. Screenshots and app launches are host-to-device and keep working,
+    so the drift is invisible until every WDA launch times out.
+    """
+    result = subprocess.run(
+        ["ip", "-brief", "link", "show"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return []
+    names = []
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if not fields:
+            continue
+        name = fields[0].split("@")[0]
+        if name.startswith("tun"):
+            names.append(name)
+    return names
+
+
 def cmd_tunnel_status(args: argparse.Namespace) -> None:
     active = active_tunnel_registry()
     if active is None:
@@ -1351,17 +1412,31 @@ def cmd_tunnel_status(args: argparse.Namespace) -> None:
         for udid, item in tunnels.items()
         if isinstance(item, dict)
     }
-    print(
-        json.dumps(
-            {
-                "ready": bool(summary),
-                "registry_ready": True,
-                "registry_port": port,
-                "tunnels": summary,
-            },
-            indent=2,
-        )
+    active_interfaces = sorted(
+        {
+            str(item.get("interface"))
+            for item in tunnels.values()
+            if isinstance(item, dict) and item.get("interface")
+        }
     )
+    unassociated = [name for name in host_tun_devices() if name not in active_interfaces]
+    state = {
+        "ready": bool(summary),
+        "registry_ready": True,
+        "registry_port": port,
+        "tunnels": summary,
+        "interfaces": {
+            "active": active_interfaces,
+            "unassociated": unassociated,
+        },
+    }
+    if unassociated:
+        state["interfaces"]["hint"] = (
+            "TUN devices not backed by an active tunnel can misroute WebDriverAgent's "
+            "device-to-host callback; if WDA fails to launch while screenshots still "
+            "work, restart ios-computer-use-tunneld@USER.service"
+        )
+    print(json.dumps(state, indent=2))
 
 
 def cmd_tunnel_start(args: argparse.Namespace) -> None:
