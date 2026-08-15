@@ -63,6 +63,9 @@ SHARE_DIR = Path(
 STATE_DIR = Path(
     os.environ.get("IOS_CUCTL_STATE_DIR", HOME_DIR / ".local/state/ios-computer-use")
 ).expanduser()
+CAPTURE_DIR = Path(
+    os.environ.get("IOS_CUCTL_CAPTURE_DIR", BRIDGE_DIR / "captures")
+).expanduser()
 PMD3 = Path(
     os.environ.get("IOS_CUCTL_PMD3")
     or shutil.which("pymobiledevice3")
@@ -1512,7 +1515,14 @@ def cmd_status(args: argparse.Namespace) -> None:
 
 
 def cmd_screenshot(args: argparse.Namespace) -> None:
-    output = Path(args.output).resolve()
+    if args.output:
+        output = Path(args.output).expanduser().resolve()
+    else:
+        output = CAPTURE_DIR / f"screenshot-{time.strftime('%Y%m%d-%H%M%S')}-{time.time_ns()}.png"
+        output = output.resolve()
+    if output.exists():
+        raise BridgeError(f"refusing to overwrite existing file: {output}")
+    output.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
     capture_any_screenshot(output, args.udid)
     width, height = png_size(output)
     print(json.dumps({"path": str(output), "width": width, "height": height}, indent=2))
@@ -1727,7 +1737,7 @@ def build_parser() -> argparse.ArgumentParser:
     add("status", "Show Appium and WDA session status", cmd_status)
 
     screenshot = add("screenshot", "Save a PNG screenshot", cmd_screenshot)
-    screenshot.add_argument("output")
+    screenshot.add_argument("output", nargs="?")
 
     source = add("source", "Print or save the current accessibility hierarchy", cmd_source)
     source.add_argument("--output")

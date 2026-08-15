@@ -6,15 +6,18 @@ install_home="${MOBILE_CU_INSTALL_HOME:-$HOME}"
 install_claude=0
 install_codex=0
 install_agents=0
+enable_android_reconnect=0
 
 usage() {
   cat <<'EOF'
-Usage: ./install.sh [--claude] [--codex] [--agents] [--all]
+Usage: ./install.sh [--claude] [--codex] [--agents] [--all] [--enable-android-reconnect]
 
   --claude  Install skills into ~/.claude/skills
   --codex   Install skills into ${CODEX_HOME:-~/.codex}/skills
   --agents  Install skills into ~/.agents/skills
   --all     Install all supported skill targets
+  --enable-android-reconnect
+            Enable the optional per-user Android wireless reconnect service
 
 With no option, --claude is used. Bridge controllers are always installed into
 ~/ios-computer-use and ~/android-computer-use. Set MOBILE_CU_INSTALL_HOME only
@@ -37,6 +40,9 @@ while [[ $# -gt 0 ]]; do
       install_claude=1
       install_codex=1
       install_agents=1
+      ;;
+    --enable-android-reconnect)
+      enable_android_reconnect=1
       ;;
     -h|--help)
       usage
@@ -84,7 +90,16 @@ install_bridge() {
       "$target_dir/ios-computer-use-tunneld@.service"
   else
     install_file 0755 "$repo_dir/bridges/android/android-cuctl" "$target_dir/android-cuctl"
+    install_file 0755 "$repo_dir/bridges/android/android-auto-reconnect" \
+      "$target_dir/android-auto-reconnect"
+    install_file 0644 "$repo_dir/bridges/android/android-computer-use-reconnect.service" \
+      "$install_home/.config/systemd/user/android-computer-use-reconnect.service"
   fi
+}
+
+install_mobile_bridge() {
+  install_file 0755 "$repo_dir/bridges/mobile/mobile-cuctl" \
+    "$install_home/mobile-cuctl/mobile-cuctl"
 }
 
 install_skill() {
@@ -101,6 +116,18 @@ install_skill() {
 
 install_bridge android
 install_bridge ios
+install_mobile_bridge
+
+if [[ "$enable_android_reconnect" -eq 1 ]]; then
+  if [[ -n "${MOBILE_CU_INSTALL_HOME:-}" ]]; then
+    printf 'Installed Android reconnect service but did not enable it in an isolated install home.\n'
+  else
+    systemctl --user daemon-reload
+    systemctl --user enable android-computer-use-reconnect.service
+    systemctl --user restart android-computer-use-reconnect.service
+    printf 'Enabled Android reconnect service for %s (no sudo).\n' "$(id -un)"
+  fi
+fi
 
 skill_roots=()
 if [[ "$install_claude" -eq 1 ]]; then
@@ -126,3 +153,4 @@ done
 printf '\nInstallation complete. Run the read-only checks:\n'
 printf '  %q doctor\n' "$install_home/android-computer-use/android-cuctl"
 printf '  %q doctor\n' "$install_home/ios-computer-use/ios-cuctl"
+printf '  %q status all\n' "$install_home/mobile-cuctl/mobile-cuctl"

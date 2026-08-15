@@ -1,0 +1,665 @@
+#!/usr/bin/env python3
+"""Unified, constrained session orchestration for the mobile computer-use bridges."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+
+USER_HOME = Path(os.environ.get("MOBILE_CUCTL_USER_HOME", Path.home())).expanduser()
+ANDROID_HOME = Path(os.environ.get("ANDROID_CUCTL_HOME", USER_HOME / "android-computer-use")).expanduser()
+IOS_HOME = Path(os.environ.get("IOS_CUCTL_HOME", USER_HOME / "ios-computer-use")).expanduser()
+ANDROID_CUCTL = Path(
+    os.environ.get("MOBILE_CUCTL_ANDROID_BIN", ANDROID_HOME / "android-cuctl")
+).expanduser()
+IOS_CUCTL = Path(os.environ.get("MOBILE_CUCTL_IOS_BIN", IOS_HOME / "ios-cuctl")).expanduser()
+STATE_DIR = Path(
+    os.environ.get(
+        "MOBILE_CUCTL_STATE_DIR",
+        Path(os.environ.get("XDG_STATE_HOME", USER_HOME / ".local/state")) / "mobile-computer-use",
+    )
+).expanduser()
+INHIBIT_BIN = os.environ.get("MOBILE_CUCTL_INHIBIT_BIN", "systemd-inhibit")
+
+CAPTURE_SUFFIXES = {".jpeg", ".jpg", ".png", ".webp", ".xml"}
+RECORDING_SUFFIXES = {".mkv", ".mov", ".mp4"}
+
+
+class ControlError(RuntimeError):
+    pass
+
+
+def fail(message: str, code: int = 1) -> None:
+    print(f"mobile-cuctl: {message}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def ensure_executable(path: Path, label: str) -> None:
+    if not path.is_file() or not os.access(path, os.X_OK):
+        raise ControlError(f"{label} controller is missing or not executable: {path}")
+
+
+def run_command(
+    command: list[str],
+    *,
+    check: bool = True,
+    timeout: float = 120.0,
+) -> subprocess.CompletedProcess[str]:
+    try:
+        result = subprocess.run(command, text=True, capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        raise ControlError(f"command timed out after {timeout:g}s: {' '.join(command)}") from exc
+    if check and result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        suffix = f": {detail}" if detail else ""
+        raise ControlError(f"command failed ({result.returncode}): {' '.join(command)}{suffix}")
+    return result
+
+
+def controller(platform: str, *arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    path = IOS_CUCTL if platform == "ios" else ANDROID_CUCTL
+    ensure_executable(path, platform)
+    return run_command([str(path), *arguments], check=check)
+
+
+def parse_json_output(result: subprocess.CompletedProcess[str], description: str) -> dict[str, Any]:
+    try:
+        value = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise ControlError(f"{description} returned invalid JSON") from exc
+    if not isinstance(value, dict):
+        raise ControlError(f"{description} did not return a JSON object")
+    return value
+
+
+def state_file(kind: str, platform: str) -> Path:
+    return STATE_DIR / f"{kind}-{platform}.json"
+
+
+def write_json(path: Path, value: dict[str, Any]) -> None:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temporary.chmod(0o600)
+    temporary.replace(path)
+
+
+def read_json(path: Path) -> dict[str, Any] | None:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def process_start_ticks(pid: int) -> int | None:
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        remainder = raw[raw.rfind(")") + 2 :].split()
+        return int(remainder[19])
+    except (FileNotFoundError, IndexError, OSError, ValueError):
+        return None
+
+
+def process_cmdline(pid: int) -> str:
+    try:
+        return Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
+    except OSError:
+        return ""
+
+
+def inhibitor_alive(platform: str) -> bool:
+    state = read_json(state_file("inhibitor", platform))
+    if not state:
+        return False
+    pid = state.get("pid")
+    ticks = state.get("start_ticks")
+    if not isinstance(pid, int) or not isinstance(ticks, int):
+        return False
+    if process_start_ticks(pid) != ticks:
+        return False
+    cmdline = process_cmdline(pid)
+    return "systemd-inhibit" in cmdline and "_hold" in cmdline
+
+
+def start_inhibitor(platform: str) -> dict[str, Any]:
+    if inhibitor_alive(platform):
+        return read_json(state_file("inhibitor", platform)) or {"active": True}
+    old_state = state_file("inhibitor", platform)
+    old_state.unlink(missing_ok=True)
+    STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    log_path = STATE_DIR / f"inhibitor-{platform}.log"
+    try:
+        with log_path.open("ab") as log_file:
+            process = subprocess.Popen(
+                [
+                    INHIBIT_BIN,
+                    "--what=sleep:idle",
+                    "--who=mobile-computer-use",
+                    f"--why={platform} device-control session",
+                    "--mode=block",
+                    "--no-ask-password",
+                    sys.executable,
+                    str(Path(__file__).resolve()),
+                    "_hold",
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=log_file,
+                stderr=log_file,
+                start_new_session=True,
+            )
+    except OSError as exc:
+        raise ControlError(f"could not start the host sleep inhibitor: {exc}") from exc
+    time.sleep(0.2)
+    if process.poll() is not None:
+        tail = log_path.read_text(encoding="utf-8", errors="replace")[-1000:]
+        raise ControlError(f"could not acquire the host sleep inhibitor: {tail.strip()}")
+    ticks = process_start_ticks(process.pid)
+    if ticks is None:
+        os.killpg(process.pid, signal.SIGTERM)
+        raise ControlError("could not verify the host sleep inhibitor process")
+    state = {
+        "active": True,
+        "pid": process.pid,
+        "start_ticks": ticks,
+        "platform": platform,
+        "started_at": int(time.time()),
+    }
+    write_json(state_file("inhibitor", platform), state)
+    return state
+
+
+def stop_inhibitor(platform: str) -> bool:
+    path = state_file("inhibitor", platform)
+    state = read_json(path)
+    if not state or not inhibitor_alive(platform):
+        path.unlink(missing_ok=True)
+        return False
+    pid = int(state["pid"])
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    for _ in range(30):
+        if process_start_ticks(pid) != state.get("start_ticks"):
+            break
+        time.sleep(0.1)
+    path.unlink(missing_ok=True)
+    return True
+
+
+def capture_path(platform: str, prefix: str = "session") -> Path:
+    home = IOS_HOME if platform == "ios" else ANDROID_HOME
+    target = home / "captures" / f"{prefix}-{time.strftime('%Y%m%d-%H%M%S')}-{time.time_ns()}.png"
+    target.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+    return target.resolve()
+
+
+def ensure_android_online() -> str:
+    result = controller("android", "serial", check=False)
+    if result.returncode != 0:
+        controller("android", "connect-auto")
+        result = controller("android", "serial")
+    serial = result.stdout.strip()
+    if not serial:
+        raise ControlError("Android controller returned an empty device serial")
+    return serial
+
+
+def start_ios(args: argparse.Namespace) -> dict[str, Any]:
+    tunnel = parse_json_output(controller("ios", "tunnel-status"), "iOS tunnel status")
+    tunnels = tunnel.get("tunnels")
+    if tunnel.get("ready") is not True or not isinstance(tunnels, dict) or len(tunnels) != 1:
+        raise ControlError(
+            "no unique ready iOS tunnel; keep the paired phone awake on the same LAN and retry tunnel-status"
+        )
+
+    baseline = capture_path("ios", "preflight")
+    controller("ios", "screenshot", str(baseline))
+    wda_started = False
+    try:
+        if args.input:
+            command = ["start"]
+            if args.app:
+                command.extend(["--bundle-id", args.app])
+            controller("ios", *command)
+            wda_started = True
+        elif args.app:
+            controller("ios", "activate", args.app)
+        final_capture = capture_path("ios", "ready")
+        controller("ios", "screenshot", str(final_capture))
+        inhibitor = None if args.no_inhibit else start_inhibitor("ios")
+        result = {
+            "ready": True,
+            "platform": "ios",
+            "transport": "persistent-tunnel",
+            "input_prepared": args.input,
+            "automation_indicator_expected": args.input,
+            "baseline_screenshot": str(baseline),
+            "screenshot": str(final_capture),
+            "host_inhibitor": inhibitor,
+            "review_screenshot_before_input": True,
+        }
+        write_json(state_file("session", "ios"), result)
+        return result
+    except Exception:
+        if wda_started:
+            controller("ios", "stop", check=False)
+        raise
+
+
+def start_android(args: argparse.Namespace) -> dict[str, Any]:
+    serial = ensure_android_online()
+    baseline = capture_path("android", "preflight")
+    controller("android", "screenshot", str(baseline))
+    awake_started = False
+    try:
+        if args.keep_awake:
+            controller("android", "awake-start")
+            awake_started = True
+        if args.app:
+            controller("android", "launch", args.app)
+        final_capture = capture_path("android", "ready")
+        controller("android", "screenshot", str(final_capture))
+        inhibitor = None if args.no_inhibit else start_inhibitor("android")
+        result = {
+            "ready": True,
+            "platform": "android",
+            "serial": serial,
+            "keep_awake": args.keep_awake,
+            "baseline_screenshot": str(baseline),
+            "screenshot": str(final_capture),
+            "host_inhibitor": inhibitor,
+            "review_screenshot_before_input": True,
+        }
+        write_json(state_file("session", "android"), result)
+        return result
+    except Exception:
+        if awake_started:
+            controller("android", "awake-stop", check=False)
+        raise
+
+
+def cmd_start(args: argparse.Namespace) -> None:
+    if args.platform == "ios" and args.keep_awake:
+        raise ControlError(
+            "iOS does not expose a safe host-side keep-awake switch; use Auto-Lock Never temporarily on a test device"
+        )
+    if args.platform == "android" and args.input:
+        raise ControlError("--input is an iOS-only WDA prewarm option")
+    result = start_ios(args) if args.platform == "ios" else start_android(args)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+def cmd_stop(args: argparse.Namespace) -> None:
+    if args.platform == "android":
+        recording = controller("android", "record-status", check=False).stdout
+        if "recording: true" in recording:
+            raise ControlError("Android recording is active; finalize it with 'mobile-cuctl record android stop' first")
+        controller("android", "awake-stop", check=False)
+    else:
+        controller("ios", "stop", check=False)
+    released = stop_inhibitor(args.platform)
+    state_file("session", args.platform).unlink(missing_ok=True)
+    print(json.dumps({"platform": args.platform, "stopped": True, "inhibitor_released": released}, indent=2))
+
+
+def platform_status(platform: str) -> dict[str, Any]:
+    if platform == "ios":
+        tunnel_result = controller("ios", "tunnel-status", check=False)
+        session_result = controller("ios", "status", check=False)
+        return {
+            "platform": "ios",
+            "tunnel": parse_json_output(tunnel_result, "iOS tunnel status")
+            if tunnel_result.returncode == 0
+            else {"error": (tunnel_result.stderr or tunnel_result.stdout).strip()},
+            "control": parse_json_output(session_result, "iOS control status")
+            if session_result.returncode == 0
+            else {"error": (session_result.stderr or session_result.stdout).strip()},
+            "host_inhibitor": inhibitor_alive("ios"),
+        }
+    devices = controller("android", "devices", check=False)
+    awake = controller("android", "awake-status", check=False)
+    recording = controller("android", "record-status", check=False)
+    return {
+        "platform": "android",
+        "devices": devices.stdout.strip(),
+        "devices_error": devices.stderr.strip() or None,
+        "awake": awake.stdout.strip(),
+        "recording": recording.stdout.strip(),
+        "host_inhibitor": inhibitor_alive("android"),
+    }
+
+
+def cmd_status(args: argparse.Namespace) -> None:
+    platforms = [args.platform] if args.platform != "all" else ["ios", "android"]
+    print(json.dumps({name: platform_status(name) for name in platforms}, ensure_ascii=False, indent=2))
+
+
+def resolve_flow_output(platform: str, requested: str | None, kind: str, suffix: str) -> Path:
+    home = IOS_HOME if platform == "ios" else ANDROID_HOME
+    if requested:
+        path = Path(requested).expanduser()
+        if not path.is_absolute():
+            path = home / "captures" / path
+    else:
+        path = home / "captures" / f"{kind}-{time.strftime('%Y%m%d-%H%M%S')}-{time.time_ns()}.{suffix}"
+    return path.resolve()
+
+
+def require_number(step: dict[str, Any], key: str) -> str:
+    value = step.get(key)
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0:
+        raise ControlError(f"flow step field '{key}' must be a non-negative number")
+    return str(value)
+
+
+def require_string(step: dict[str, Any], key: str) -> str:
+    value = step.get(key)
+    if not isinstance(value, str) or not value:
+        raise ControlError(f"flow step field '{key}' must be a non-empty string")
+    return value
+
+
+def flow_command(platform: str, step: dict[str, Any]) -> tuple[list[str] | None, float | None]:
+    action = step.get("action")
+    if action == "pause":
+        seconds = float(require_number(step, "seconds"))
+        if seconds > 30:
+            raise ControlError("flow pauses are capped at 30 seconds")
+        return None, seconds
+    binary = str(IOS_CUCTL if platform == "ios" else ANDROID_CUCTL)
+    if platform == "ios":
+        if action == "activate":
+            return [binary, "activate", require_string(step, "bundle_id")], None
+        if action == "screenshot":
+            output = resolve_flow_output("ios", step.get("file"), "flow", "png")
+            return [binary, "screenshot", str(output)], None
+        if action == "tap-image":
+            command = [binary, "tap-image", require_number(step, "x"), require_number(step, "y")]
+            if step.get("image"):
+                command.extend(["--image", require_string(step, "image")])
+            return command, None
+        if action == "swipe-image":
+            command = [
+                binary,
+                "swipe-image",
+                require_number(step, "x1"),
+                require_number(step, "y1"),
+                require_number(step, "x2"),
+                require_number(step, "y2"),
+            ]
+            if step.get("image"):
+                command.extend(["--image", require_string(step, "image")])
+            if "duration_ms" in step:
+                command.extend(["--duration-ms", require_number(step, "duration_ms")])
+            return command, None
+        if action == "tap-element":
+            command = [binary, "tap-element", require_string(step, "selector")]
+            if step.get("using"):
+                command.extend(["--using", require_string(step, "using")])
+            return command, None
+        if action == "press":
+            name = require_string(step, "name")
+            if name not in {"home", "volumeUp", "volumeDown"}:
+                raise ControlError("iOS flow press supports only home, volumeUp, or volumeDown")
+            return [binary, "press", name], None
+    else:
+        if action == "launch":
+            return [binary, "launch", require_string(step, "package")], None
+        if action == "screenshot":
+            output = resolve_flow_output("android", step.get("file"), "flow", "png")
+            return [binary, "screenshot", str(output)], None
+        if action == "ui-dump":
+            output = resolve_flow_output("android", step.get("file"), "flow", "xml")
+            return [binary, "ui-dump", str(output)], None
+        if action == "tap":
+            return [binary, "tap", require_number(step, "x"), require_number(step, "y")], None
+        if action == "swipe":
+            command = [
+                binary,
+                "swipe",
+                require_number(step, "x1"),
+                require_number(step, "y1"),
+                require_number(step, "x2"),
+                require_number(step, "y2"),
+            ]
+            if "duration_ms" in step:
+                command.append(require_number(step, "duration_ms"))
+            return command, None
+        if action == "key":
+            name = require_string(step, "name")
+            if name not in {"KEYCODE_BACK", "KEYCODE_ENTER", "KEYCODE_HOME"}:
+                raise ControlError("Android flow key supports only BACK, ENTER, or HOME")
+            return [binary, "key", name], None
+    raise ControlError(f"unsupported {platform} flow action: {action!r}")
+
+
+def load_flow(path: Path) -> tuple[str, list[dict[str, Any]]]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ControlError(f"could not read flow {path}: {exc}") from exc
+    if not isinstance(value, dict) or value.get("schema_version") != 1:
+        raise ControlError("flow must be a JSON object with schema_version 1")
+    platform = value.get("platform")
+    if platform not in {"ios", "android"}:
+        raise ControlError("flow platform must be 'ios' or 'android'")
+    steps = value.get("steps")
+    if not isinstance(steps, list) or not steps:
+        raise ControlError("flow steps must be a non-empty list")
+    if len(steps) > 200:
+        raise ControlError("flow is capped at 200 steps")
+    if not all(isinstance(step, dict) for step in steps):
+        raise ControlError("every flow step must be an object")
+    return platform, steps
+
+
+def cmd_flow(args: argparse.Namespace) -> None:
+    path = Path(args.file).expanduser().resolve()
+    platform, steps = load_flow(path)
+    planned: list[dict[str, Any]] = []
+    for index, step in enumerate(steps, start=1):
+        command, pause = flow_command(platform, step)
+        planned.append({"step": index, "command": command, "pause_seconds": pause})
+    if args.dry_run:
+        print(json.dumps({"platform": platform, "steps": planned}, ensure_ascii=False, indent=2))
+        return
+    for item in planned:
+        print(f"flow step {item['step']}/{len(planned)}", file=sys.stderr)
+        if item["pause_seconds"] is not None:
+            time.sleep(item["pause_seconds"])
+            continue
+        result = run_command(item["command"])
+        if result.stdout:
+            print(result.stdout, end="")
+
+
+def walk_managed_files(root: Path, suffixes: set[str]) -> list[Path]:
+    if not root.is_dir() or root.is_symlink():
+        return []
+    resolved_root = root.resolve()
+    matches: list[Path] = []
+    for directory, subdirs, files in os.walk(root, followlinks=False):
+        directory_path = Path(directory)
+        subdirs[:] = [name for name in subdirs if not (directory_path / name).is_symlink()]
+        for name in files:
+            candidate = directory_path / name
+            if candidate.is_symlink() or candidate.suffix.lower() not in suffixes:
+                continue
+            try:
+                resolved = candidate.resolve(strict=True)
+                resolved.relative_to(resolved_root)
+            except (FileNotFoundError, OSError, ValueError):
+                continue
+            matches.append(candidate)
+    return matches
+
+
+def cleanup_roots(platform: str) -> tuple[list[Path], list[Path]]:
+    captures: list[Path] = []
+    recordings: list[Path] = []
+    if platform in {"all", "android"}:
+        captures.append(ANDROID_HOME / "captures")
+        recordings.append(ANDROID_HOME / "recordings")
+    if platform in {"all", "ios"}:
+        captures.extend([IOS_HOME / "captures", IOS_HOME / "verification"])
+        recordings.append(IOS_HOME / "recordings")
+    return captures, recordings
+
+
+def cmd_cleanup(args: argparse.Namespace) -> None:
+    now = time.time()
+    capture_cutoff = now - args.captures_days * 86400
+    recording_cutoff = now - args.recordings_days * 86400
+    capture_roots, recording_roots = cleanup_roots(args.platform)
+    candidates: list[tuple[str, Path, int]] = []
+    for root in capture_roots:
+        for path in walk_managed_files(root, CAPTURE_SUFFIXES):
+            stat = path.stat()
+            if stat.st_mtime <= capture_cutoff:
+                candidates.append(("capture", path, stat.st_size))
+    for root in recording_roots:
+        for path in walk_managed_files(root, RECORDING_SUFFIXES):
+            stat = path.stat()
+            if stat.st_mtime <= recording_cutoff:
+                candidates.append(("recording", path, stat.st_size))
+
+    deleted = 0
+    deleted_bytes = 0
+    if args.apply:
+        for _, path, size in candidates:
+            path.unlink()
+            deleted += 1
+            deleted_bytes += size
+    result = {
+        "mode": "apply" if args.apply else "dry-run",
+        "platform": args.platform,
+        "capture_retention_days": args.captures_days,
+        "recording_retention_days": args.recordings_days,
+        "eligible_files": len(candidates),
+        "eligible_bytes": sum(item[2] for item in candidates),
+        "deleted_files": deleted,
+        "deleted_bytes": deleted_bytes,
+        "files": [{"kind": kind, "path": str(path), "bytes": size} for kind, path, size in candidates],
+    }
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+def cmd_record(args: argparse.Namespace) -> None:
+    if args.file and args.action != "start":
+        raise ControlError("a recording file may be supplied only with the start action")
+    if args.platform != "android":
+        raise ControlError(
+            "iOS native screen recording remains a user-authorized Control Center action; use session start for preflight"
+        )
+    if args.action == "start":
+        ensure_android_online()
+        command = ["record-start"]
+        if args.file:
+            command.append(args.file)
+        owned_inhibitor = not inhibitor_alive("android")
+        inhibitor = start_inhibitor("android")
+        try:
+            result = controller("android", *command)
+        except Exception:
+            if owned_inhibitor:
+                stop_inhibitor("android")
+            raise
+        write_json(
+            state_file("recording", "android"),
+            {"owns_inhibitor": owned_inhibitor, "started_at": int(time.time())},
+        )
+        print(result.stdout, end="")
+        print(json.dumps({"host_inhibitor": inhibitor}, indent=2))
+    elif args.action == "status":
+        print(controller("android", "record-status").stdout, end="")
+    else:
+        state = read_json(state_file("recording", "android")) or {}
+        print(controller("android", "record-stop").stdout, end="")
+        if state.get("owns_inhibitor") is True:
+            stop_inhibitor("android")
+        state_file("recording", "android").unlink(missing_ok=True)
+
+
+def cmd_hold(_: argparse.Namespace) -> None:
+    signal.signal(signal.SIGTERM, lambda *_: raise_exit())
+    signal.signal(signal.SIGINT, lambda *_: raise_exit())
+    while True:
+        signal.pause()
+
+
+def raise_exit() -> None:
+    raise SystemExit(0)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="mobile-cuctl",
+        description="Prepare and manage efficient Android/iOS computer-use sessions without sudo.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    start = sub.add_parser("start", help="Prepare one device-control session")
+    start.add_argument("platform", choices=["ios", "android"])
+    start.add_argument("--app", help="Bundle ID or Android package to activate")
+    start.add_argument("--input", action="store_true", help="Prewarm Appium/WDA for iOS input")
+    start.add_argument("--keep-awake", action="store_true", help="Keep Android awake through scrcpy")
+    start.add_argument("--no-inhibit", action="store_true", help="Do not inhibit host idle/sleep")
+    start.set_defaults(handler=cmd_start)
+
+    stop = sub.add_parser("stop", help="End input/awake state and release the host inhibitor")
+    stop.add_argument("platform", choices=["ios", "android"])
+    stop.set_defaults(handler=cmd_stop)
+
+    status = sub.add_parser("status", help="Show connection, input, recording, and inhibitor state")
+    status.add_argument("platform", choices=["ios", "android", "all"], nargs="?", default="all")
+    status.set_defaults(handler=cmd_status)
+
+    flow = sub.add_parser("flow", help="Validate or run a restricted JSON action flow")
+    flow.add_argument("file")
+    mode = flow.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--dry-run", action="store_true")
+    mode.add_argument("--run", action="store_true")
+    flow.set_defaults(handler=cmd_flow)
+
+    cleanup = sub.add_parser("cleanup", help="Preview or remove old bridge-managed captures and recordings")
+    cleanup.add_argument("--platform", choices=["ios", "android", "all"], default="all")
+    cleanup.add_argument("--captures-days", type=int, default=7)
+    cleanup.add_argument("--recordings-days", type=int, default=14)
+    cleanup.add_argument("--apply", action="store_true", help="Delete eligible files; default is dry-run")
+    cleanup.set_defaults(handler=cmd_cleanup)
+
+    record = sub.add_parser("record", help="Manage Android scrcpy recording")
+    record.add_argument("platform", choices=["ios", "android"])
+    record.add_argument("action", choices=["start", "status", "stop"])
+    record.add_argument("file", nargs="?")
+    record.set_defaults(handler=cmd_record)
+
+    hold = sub.add_parser("_hold", help="Internal host-inhibitor helper")
+    hold.set_defaults(handler=cmd_hold)
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    if hasattr(args, "captures_days") and (args.captures_days < 0 or args.recordings_days < 0):
+        fail("retention days must be non-negative")
+    try:
+        args.handler(args)
+    except ControlError as exc:
+        fail(str(exc))
+    except KeyboardInterrupt:
+        fail("interrupted", 130)
+
+
+if __name__ == "__main__":
+    main()

@@ -16,12 +16,15 @@ cd mobile-computer-use
 ~/.claude/skills/android-computer-use/SKILL.md
 ~/.claude/skills/ios-computer-use/SKILL.md
 ~/android-computer-use/android-cuctl
+~/android-computer-use/android-auto-reconnect
 ~/android-computer-use/AGENTS.md
 ~/ios-computer-use/ios-cuctl
 ~/ios-computer-use/wda-runner
 ~/ios-computer-use/ios-tunneld-runner
 ~/ios-computer-use/ios-computer-use-tunneld@.service
 ~/ios-computer-use/AGENTS.md
+~/mobile-cuctl/mobile-cuctl
+~/.config/systemd/user/android-computer-use-reconnect.service
 ```
 
 如果 Claude Code 启动时 `~/.claude/skills` 目录尚不存在，安装后重新启动一次 Claude Code。已存在的技能目录通常支持热加载。
@@ -45,6 +48,7 @@ cd mobile-computer-use
 
 "$HOME/ios-computer-use/ios-cuctl" --help
 "$HOME/ios-computer-use/ios-cuctl" doctor
+"$HOME/mobile-cuctl/mobile-cuctl" status all
 ```
 
 技能不会绕过 Claude Code 自身的工具授权、操作系统权限、手机 Trust/RSA 提示、锁屏、PIN、Face ID/Touch ID 或 App 登录边界。
@@ -70,6 +74,19 @@ cd mobile-computer-use
 ```
 
 `connect-auto` 会直接复用唯一的在线无线目标；否则只会在局域网中恰好发现一个已配对 connect 服务时继续。mDNS 广播消失不代表已建立的 ADB 连接不可用。多个设备时必须显式选择。
+
+需要后台自动恢复时启用普通用户服务，不需要 sudo：
+
+```bash
+systemctl --user enable --now android-computer-use-reconnect.service
+```
+
+长流程可以直接使用统一预检，避免每一步重新发现设备：
+
+```bash
+"$HOME/mobile-cuctl/mobile-cuctl" start android --keep-awake
+"$HOME/mobile-cuctl/mobile-cuctl" stop android
+```
 
 每次坐标输入前都先截新图。部分厂商输入法会把 `text-ascii` 留在拼写/候选状态；检查操作后截图，仅在确认需要提交该文本时再发送 `KEYCODE_ENTER`。
 
@@ -115,11 +132,29 @@ sudo systemctl enable --now "ios-computer-use-tunneld@$(id -un).service"
 
 已安装上面的 systemd 服务时，不要再运行 `wifi-tunnel-start`；bridge 会从端口 `49151` 自动发现并复用常驻 tunnel。
 
+长流程使用统一预检；`--input` 会在设备已解锁时预热一次 WDA，后续动作复用该会话：
+
+```bash
+"$HOME/mobile-cuctl/mobile-cuctl" start ios --input
+"$HOME/mobile-cuctl/mobile-cuctl" stop ios
+```
+
 日常无线操作先运行 `tunnel-status`。`ready: true` 且只有一个 tunnel 时，直接使用 `screenshot`、`apps`、`activate` 或 `press`，不要重复发现、启动 tunnel 或启动 WDA；这些 CoreDevice 操作不会显示 Automation Running。`registry_ready: true` 但 `ready: false` 表示后台服务在线、手机 tunnel 不在线，此时让手机保持唤醒且 Wi-Fi 开启，并确认与主机处于同一局域网。
 
 iOS 26 及更早版本的触控、文字输入和 accessibility 仍需要 Appium/WDA，除非已经准备好兼容 persistent preinstalled launch 的 WDA v13+ 包，否则 USB + WDA 最可靠；iOS 27+ 可直接使用 CoreDevice 触控。锁屏时可以尝试 CoreDevice 截图和硬件键，但屏幕休眠可能先得到全黑截图：发送一次可逆的 Home 键、重新截图，再由用户解锁后继续，不能绕过锁屏。
 
 完整操作、环境变量和恢复说明见安装后的 `$HOME/ios-computer-use/AGENTS.md`。
+
+## 录屏和定期清理
+
+Android 可通过 `mobile-cuctl record android start|status|stop` 无窗口录屏；必须用 `stop` 正常封装文件。iOS 系统录屏仍由用户在控制中心授权开启和停止。
+
+清理命令默认只预览，截图/UI dump 保留 7 天，Home bridge 自己的录屏保留 14 天；业务项目的 `artifacts/` 不在扫描范围内：
+
+```bash
+"$HOME/mobile-cuctl/mobile-cuctl" cleanup
+"$HOME/mobile-cuctl/mobile-cuctl" cleanup --apply
+```
 
 ## 更新与卸载
 
@@ -132,11 +167,18 @@ git pull --ff-only
 
 安装器只替换它管理的控制器、操作指南和技能文件，并为不同内容的旧文件创建带时间戳的备份；不会删除 captures、runtime、状态文件或签名材料。
 
-如需卸载，手动移除以下两个技能目录和两个 bridge 目录。删除前先保留其中需要的 captures、runtime 或本机配置：
+如需卸载，先停用用户级 Android 重连服务，再手动移除技能和 bridge 目录。删除前先保留其中需要的 captures、recordings、runtime 或本机配置：
+
+```bash
+systemctl --user disable --now android-computer-use-reconnect.service
+rm "$HOME/.config/systemd/user/android-computer-use-reconnect.service"
+systemctl --user daemon-reload
+```
 
 ```text
 ~/.claude/skills/android-computer-use
 ~/.claude/skills/ios-computer-use
 ~/android-computer-use
 ~/ios-computer-use
+~/mobile-cuctl
 ```

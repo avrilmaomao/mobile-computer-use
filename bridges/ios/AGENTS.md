@@ -2,6 +2,8 @@
 
 Use `"$HOME/ios-computer-use/ios-cuctl"` as the stable entry point for a user-authorized physical iPhone or iPad. Do not copy signing assets or reimplement device commands in a task workspace.
 
+Use `"$HOME/mobile-cuctl/mobile-cuctl"` to prepare and stop longer sessions, validate restricted flows, and clean bridge-managed captures. The unified controller delegates to `ios-cuctl`; it does not bypass any iOS boundary.
+
 ## Host configuration
 
 The bridge is portable and reads these optional environment variables:
@@ -36,6 +38,16 @@ When the phone has already been paired and the persistent tunnel service is inst
 If `tunnel-status` reports `ready: true` with exactly one tunnel, reuse it. `registry_ready: true` with `ready: false` means the background service is healthy but no phone tunnel is currently active; keep the phone awake with Wi-Fi enabled and confirm it is on the same LAN. Use `wireless-browse` only when the registry has no active phone; its output is deduplicated by device and endpoint. Run `doctor` and `devices` for first-time setup, USB work, or troubleshooting rather than before every routine action.
 
 If more than one tunneled or trusted USB device is present, pass `--udid` before the subcommand. Never guess which device the user intended.
+
+For a longer task, prepare one session without sudo:
+
+```bash
+"$HOME/mobile-cuctl/mobile-cuctl" start ios
+"$HOME/mobile-cuctl/mobile-cuctl" start ios --input
+"$HOME/mobile-cuctl/mobile-cuctl" stop ios
+```
+
+The first form verifies the persistent tunnel, saves baseline and ready screenshots, and acquires a host idle/sleep inhibitor without WDA. Add `--input` only when the unlocked phone needs touch, text, or accessibility; it prewarms one reusable WDA session. Inspect the returned screenshot before input. `stop` removes WDA's automation indicator and releases the inhibitor while leaving the persistent tunnel running.
 
 For the simplest no-banner path, keep the RemoteXPC tunnel running and use `screenshot`, `activate`, or hardware `press`. CoreDevice screen capture and app launch do not start XCTest, so iOS does not show the "Automation Running" indicator.
 
@@ -162,3 +174,14 @@ Never bypass a lock screen, biometric prompt, secure-input restriction, develope
 Obtain explicit user authorization immediately before consequential actions such as sending messages, placing calls, making purchases or trades, changing accounts or security settings, entering a PIN/password/OTP, installing or removing apps or profiles, changing Developer Mode, trusting a developer identity, or rebooting the device.
 
 System screen recording may be operated through Control Center when the user asks and authorizes it. Treat recordings as user data and confirm where the resulting file should be retained or exported.
+
+The bridge intentionally leaves native iOS screen-record start/stop in Control Center because that system UI varies by device and configuration. Use the unified session preflight before recording, then keep the same WDA session for the whole flow. Restricted JSON flows may be dry-run with `mobile-cuctl flow FILE --dry-run`; inspect the entire flow before `--run`, and stop at normal authorization boundaries.
+
+Preview periodic cleanup with:
+
+```bash
+"$HOME/mobile-cuctl/mobile-cuctl" cleanup --platform ios
+"$HOME/mobile-cuctl/mobile-cuctl" cleanup --platform ios --apply
+```
+
+Defaults are bridge captures/UI dumps older than 7 days and files under `$HOME/ios-computer-use/recordings/` older than 14 days. `--apply` is required. The cleaner ignores symlinks, does not touch signing/state files, and never scans project artifact directories.

@@ -5,7 +5,9 @@ This directory is the canonical implementation for operating a user-authorized p
 ## Paths
 
 - Controller: `"$HOME/android-computer-use/android-cuctl"`
+- Unified session controller: `"$HOME/mobile-cuctl/mobile-cuctl"`
 - Captures and UI dumps: `$HOME/android-computer-use/captures/`
+- Background recordings: `$HOME/android-computer-use/recordings/`
 - Agent skill: install `skills/android-computer-use/SKILL.md` into the agent's personal skill directory
 
 Run `"$HOME/android-computer-use/android-cuctl" --help` to see the supported command surface.
@@ -32,6 +34,15 @@ For a host and phone that have already been configured, begin with:
 ```
 
 If exactly one wireless `HOST:PORT` target is already in `device` state, use it directly. Do not run `doctor`, `discover`, or `connect-auto` on every task. Use `doctor` for first-time setup or tool/connection troubleshooting; take a fresh screenshot next so a lock screen or changed UI is visible before input.
+
+For a multi-step task, prepare one reusable session instead of repeating connection checks:
+
+```bash
+"$HOME/mobile-cuctl/mobile-cuctl" start android --keep-awake
+"$HOME/mobile-cuctl/mobile-cuctl" stop android
+```
+
+`start` reuses or uniquely reconnects an already-paired target, saves baseline and ready screenshots, optionally runs a headless scrcpy stay-awake session, and acquires a host idle/sleep inhibitor. It never uses sudo. Inspect the returned screenshot before input. `stop` restores the scrcpy stay-awake state and releases the host inhibitor.
 
 ## First-time phone setup
 
@@ -82,6 +93,17 @@ Android may stop advertising an mDNS service while the already-established ADB c
 
 Do not expose legacy unauthenticated ADB-over-TCP port 5555 to a LAN or the Internet.
 
+### Optional no-sudo automatic reconnect
+
+The installer includes a per-user systemd service that checks existing connections first and calls `connect-auto` only when no wireless target is online. `connect-auto` still refuses zero or multiple paired mDNS targets. Enable it without sudo:
+
+```bash
+systemctl --user enable --now android-computer-use-reconnect.service
+systemctl --user status android-computer-use-reconnect.service --no-pager
+```
+
+Disable it with `systemctl --user disable --now android-computer-use-reconnect.service`. Pairing a new device and accepting the phone's RSA boundary remain manual user actions.
+
 ## Device selection
 
 The controller proceeds automatically only when exactly one authorized device is attached. If more than one physical device or emulator appears, select the exact serial for the task:
@@ -107,6 +129,31 @@ Screens can change due to animation, rotation, dialogs, the keyboard, or notific
 `text-ascii` deliberately accepts only conservative ASCII. Some vendor keyboards leave injected text in an IME composing buffer instead of committing it immediately. Inspect the after-action screenshot; use `key KEYCODE_ENTER` only when committing that text is the intended reversible action. For Unicode text, use the on-screen keyboard through inspected taps, paste manually with the user's awareness, or install a trusted input-method helper only after explicit approval. Never place passwords, PINs, or one-time codes in command history or logs.
 
 Use `android-cuctl mirror` for live scrcpy viewing. If an agent must control the scrcpy window itself, it must also load the `wayland-computer-use` skill and follow that skill's desktop-control rules.
+
+## Recording and reusable flows
+
+Record Android in the background without a desktop window or audio:
+
+```bash
+"$HOME/android-computer-use/android-cuctl" record-start demo.mp4
+"$HOME/android-computer-use/android-cuctl" record-status
+"$HOME/android-computer-use/android-cuctl" record-stop
+```
+
+The recording process also keeps the phone awake. Always use `record-stop` so scrcpy can finalize the MP4/MKV container. Relative output names are stored under `$HOME/android-computer-use/recordings/`. The unified equivalents are `mobile-cuctl record android start|status|stop`.
+
+For rehearsed, reversible navigation, `mobile-cuctl flow FILE --dry-run` validates a JSON schema-version-1 flow and prints every command. Inspect the flow and its dry-run before `--run`. The runner accepts only a small action whitelist and no arbitrary shell, but taps can still reach consequential UI; pause for the normal authorization boundary before such actions.
+
+## Manual cleanup
+
+Preview cleanup before applying it:
+
+```bash
+"$HOME/mobile-cuctl/mobile-cuctl" cleanup --platform android
+"$HOME/mobile-cuctl/mobile-cuctl" cleanup --platform android --apply
+```
+
+Defaults are captures/UI dumps older than 7 days and files under the bridge `recordings/` directory older than 14 days. The cleaner ignores symlinks and never traverses outside the bridge-managed directories. Project artifacts are outside its scope.
 
 ## Safety boundary
 

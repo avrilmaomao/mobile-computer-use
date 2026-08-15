@@ -5,6 +5,8 @@ script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 core_dir="${ANDROID_CUCTL_HOME:-$script_dir}"
 capture_dir="$core_dir/captures"
 runtime_dir="$core_dir/runtime"
+recording_dir="$core_dir/recordings"
+state_dir="${ANDROID_CUCTL_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/android-computer-use}"
 
 if [[ -x "$runtime_dir/adb" && -x "$runtime_dir/scrcpy" ]]; then
   export PATH="$runtime_dir:$PATH"
@@ -40,6 +42,14 @@ Input:
 
 Viewing:
   mirror [SCRCPY_ARGS...]        Open scrcpy for the selected device
+  awake-start                    Keep the selected device awake for this session
+  awake-status                   Show the background stay-awake session
+  awake-stop                     Stop the stay-awake session and restore scrcpy state
+
+Recording:
+  record-start [FILE]            Record with scrcpy in the background (no audio)
+  record-status                  Show the active recording and output path
+  record-stop                    Finalize and stop the active recording
 
 Set ANDROID_SERIAL to select an exact authorized device when multiple devices
 are present. Relative output FILE names are stored under:
@@ -106,6 +116,107 @@ output_path() {
 
 require_uint() {
   [[ "$1" =~ ^[0-9]+$ ]] || fail "expected a non-negative integer, got '$1'"
+}
+
+state_path() {
+  printf '%s/%s.%s\n' "$state_dir" "$1" "$2"
+}
+
+read_state_value() {
+  local file
+  file="$(state_path "$1" "$2")"
+  [[ -f "$file" ]] || return 1
+  IFS= read -r REPLY <"$file"
+  printf '%s\n' "$REPLY"
+}
+
+process_start_ticks() {
+  local pid="$1"
+  awk '{ print $22 }' "/proc/$pid/stat" 2>/dev/null || true
+}
+
+background_scrcpy_alive() {
+  local kind="$1"
+  local pid stored_ticks
+  pid="$(read_state_value "$kind" pid 2>/dev/null || true)"
+  stored_ticks="$(read_state_value "$kind" start 2>/dev/null || true)"
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  [[ "$stored_ticks" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  [[ "$(process_start_ticks "$pid")" == "$stored_ticks" ]] || return 1
+  [[ -r "/proc/$pid/cmdline" ]] || return 1
+  [[ "$(awk '{ print $3 }' "/proc/$pid/stat" 2>/dev/null || true)" != "Z" ]] || return 1
+  tr '\0' '\n' <"/proc/$pid/cmdline" | grep -Eq '(^|/)scrcpy$'
+}
+
+clear_background_state() {
+  local kind="$1"
+  rm -f -- \
+    "$(state_path "$kind" pid)" \
+    "$(state_path "$kind" start)" \
+    "$(state_path "$kind" serial)" \
+    "$(state_path "$kind" output)"
+}
+
+stop_background_scrcpy() {
+  local kind="$1"
+  local required="${2:-1}"
+  local pid
+  pid="$(read_state_value "$kind" pid 2>/dev/null || true)"
+  if ! background_scrcpy_alive "$kind"; then
+    clear_background_state "$kind"
+    if [[ "$required" -eq 1 ]]; then
+      fail "no active $kind session"
+    fi
+    return 0
+  fi
+
+  kill -INT "$pid"
+  for _ in $(seq 1 30); do
+    if ! background_scrcpy_alive "$kind"; then
+      clear_background_state "$kind"
+      return 0
+    fi
+    sleep 0.1
+  done
+  kill -TERM "$pid" 2>/dev/null || true
+  for _ in $(seq 1 20); do
+    if ! background_scrcpy_alive "$kind"; then
+      clear_background_state "$kind"
+      return 0
+    fi
+    sleep 0.1
+  done
+  fail "$kind process $pid did not stop cleanly"
+}
+
+start_background_scrcpy() {
+  local kind="$1"
+  local serial="$2"
+  shift 2
+  local log_file="$state_dir/$kind.log"
+
+  mkdir -p "$state_dir"
+  chmod 700 "$state_dir"
+  if background_scrcpy_alive "$kind"; then
+    fail "$kind session is already active"
+  fi
+  clear_background_state "$kind"
+
+  nohup scrcpy --serial "$serial" --no-window --no-audio --stay-awake "$@" \
+    >"$log_file" 2>&1 &
+  local pid=$!
+  printf '%s\n' "$pid" >"$(state_path "$kind" pid)"
+  printf '%s\n' "$(process_start_ticks "$pid")" >"$(state_path "$kind" start)"
+  printf '%s\n' "$serial" >"$(state_path "$kind" serial)"
+
+  sleep 0.6
+  if background_scrcpy_alive "$kind"; then
+    return 0
+  fi
+  clear_background_state "$kind"
+  tail -n 20 "$log_file" >&2 || true
+  fail "scrcpy $kind session exited during startup"
 }
 
 command="${1:---help}"
@@ -322,6 +433,87 @@ case "$command" in
     need_cmd scrcpy
     serial="$(selected_serial)"
     scrcpy --serial "$serial" "$@"
+    ;;
+
+  awake-start)
+    [[ $# -eq 0 ]] || fail "usage: android-cuctl awake-start"
+    need_cmd scrcpy
+    serial="$(selected_serial)"
+    start_background_scrcpy awake "$serial"
+    printf 'stay-awake active for %s\n' "$serial"
+    ;;
+
+  awake-status)
+    [[ $# -eq 0 ]] || fail "usage: android-cuctl awake-status"
+    if background_scrcpy_alive awake; then
+      printf 'active: true\nserial: %s\npid: %s\n' \
+        "$(read_state_value awake serial)" "$(read_state_value awake pid)"
+    else
+      clear_background_state awake
+      printf 'active: false\n'
+    fi
+    ;;
+
+  awake-stop)
+    [[ $# -eq 0 ]] || fail "usage: android-cuctl awake-stop"
+    if background_scrcpy_alive awake; then
+      stop_background_scrcpy awake
+      printf 'stay-awake stopped\n'
+    else
+      clear_background_state awake
+      printf 'stay-awake already stopped\n'
+    fi
+    ;;
+
+  record-start)
+    [[ $# -le 1 ]] || fail "usage: android-cuctl record-start [FILE]"
+    need_cmd scrcpy
+    if background_scrcpy_alive record; then
+      fail "recording is already active; run 'android-cuctl record-status'"
+    fi
+    if background_scrcpy_alive awake; then
+      stop_background_scrcpy awake
+    fi
+    serial="$(selected_serial)"
+    requested="${1:-}"
+    mkdir -p "$recording_dir"
+    if [[ -z "$requested" ]]; then
+      target="$recording_dir/recording-$(date +%Y%m%d-%H%M%S-%N).mp4"
+    elif [[ "$requested" == /* ]]; then
+      target="$requested"
+    else
+      target="$recording_dir/$requested"
+    fi
+    case "$target" in
+      *.mp4|*.mkv) ;;
+      *) fail "recording output must end in .mp4 or .mkv" ;;
+    esac
+    [[ ! -e "$target" ]] || fail "refusing to overwrite existing file '$target'"
+    mkdir -p "$(dirname -- "$target")"
+    start_background_scrcpy record "$serial" --record "$target"
+    printf '%s\n' "$target" >"$(state_path record output)"
+    printf 'recording: true\nserial: %s\npath: %s\n' "$serial" "$target"
+    ;;
+
+  record-status)
+    [[ $# -eq 0 ]] || fail "usage: android-cuctl record-status"
+    if background_scrcpy_alive record; then
+      printf 'recording: true\nserial: %s\npid: %s\npath: %s\n' \
+        "$(read_state_value record serial)" \
+        "$(read_state_value record pid)" \
+        "$(read_state_value record output)"
+    else
+      clear_background_state record
+      printf 'recording: false\n'
+    fi
+    ;;
+
+  record-stop)
+    [[ $# -eq 0 ]] || fail "usage: android-cuctl record-stop"
+    target="$(read_state_value record output 2>/dev/null || true)"
+    stop_background_scrcpy record
+    [[ -n "$target" && -s "$target" ]] || fail "recording stopped but no non-empty output was produced"
+    printf '%s\n' "$target"
     ;;
 
   *)
